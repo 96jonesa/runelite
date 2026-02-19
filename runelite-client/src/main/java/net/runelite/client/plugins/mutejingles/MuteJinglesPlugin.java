@@ -25,9 +25,11 @@
 package net.runelite.client.plugins.mutejingles;
 
 import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.client.callback.ClientThread;
@@ -35,6 +37,7 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 
+@Slf4j
 @PluginDescriptor(
 	name = "Mute Jingles",
 	description = "Mutes jingles (level up, quest complete, etc.) to prevent in-game music from restarting",
@@ -84,6 +87,12 @@ public class MuteJinglesPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onGameTick(GameTick gameTick)
+	{
+		log.info("OPTION_JINGLES varp = {}", client.getVarpValue(VarPlayerID.OPTION_JINGLES));
+	}
+
+	@Subscribe
 	public void onVarbitChanged(VarbitChanged varbitChanged)
 	{
 		if (varbitChanged.getVarpId() == VarPlayerID.OPTION_JINGLES
@@ -98,6 +107,7 @@ public class MuteJinglesPlugin extends Plugin
 	private void muteJingles()
 	{
 		previousJingleVolume = client.getVarpValue(VarPlayerID.OPTION_JINGLES);
+		log.info("muteJingles: saving previousJingleVolume={}, setting to 0", previousJingleVolume);
 		client.getVarps()[VarPlayerID.OPTION_JINGLES] = 0;
 		client.queueChangedVarp(VarPlayerID.OPTION_JINGLES);
 	}
