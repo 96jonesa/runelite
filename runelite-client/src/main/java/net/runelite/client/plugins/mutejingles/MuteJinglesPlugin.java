@@ -24,13 +24,14 @@
  */
 package net.runelite.client.plugins.mutejingles;
 
+import java.util.List;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.MidiRequest;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
-import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
@@ -52,73 +53,20 @@ public class MuteJinglesPlugin extends Plugin
 	@Inject
 	private ClientThread clientThread;
 
-	private int previousJingleVolume = -1;
-
-	@Override
-	protected void startUp()
-	{
-		clientThread.invoke(() ->
-		{
-			if (client.getGameState() == GameState.LOGGED_IN)
-			{
-				muteJingles();
-			}
-		});
-	}
-
-	@Override
-	protected void shutDown()
-	{
-		clientThread.invoke(this::restoreJingles);
-	}
-
-	@Subscribe
-	public void onGameStateChanged(GameStateChanged gameStateChanged)
-	{
-		GameState gameState = gameStateChanged.getGameState();
-		if (gameState == GameState.LOGGED_IN)
-		{
-			muteJingles();
-		}
-		else if (gameState == GameState.LOGIN_SCREEN)
-		{
-			previousJingleVolume = -1;
-		}
-	}
-
 	@Subscribe
 	public void onGameTick(GameTick gameTick)
 	{
-		log.info("OPTION_JINGLES varp = {}", client.getVarpValue(VarPlayerID.OPTION_JINGLES));
-	}
-
-	@Subscribe
-	public void onVarbitChanged(VarbitChanged varbitChanged)
-	{
-		if (varbitChanged.getVarpId() == VarPlayerID.OPTION_JINGLES
-			&& varbitChanged.getValue() != 0)
+		List<MidiRequest> midiRequests = client.getActiveMidiRequests();
+		for (MidiRequest req : midiRequests)
 		{
-			previousJingleVolume = varbitChanged.getValue();
-			client.getVarps()[VarPlayerID.OPTION_JINGLES] = 0;
-			client.queueChangedVarp(VarPlayerID.OPTION_JINGLES);
+			log.info("Active MIDI: archiveId={}, isJingle={}", req.getArchiveId(), req.isJingle());
 		}
-	}
 
-	private void muteJingles()
-	{
-		previousJingleVolume = client.getVarpValue(VarPlayerID.OPTION_JINGLES);
-		log.info("muteJingles: saving previousJingleVolume={}, setting to 0", previousJingleVolume);
-		client.getVarps()[VarPlayerID.OPTION_JINGLES] = 0;
-		client.queueChangedVarp(VarPlayerID.OPTION_JINGLES);
-	}
-
-	private void restoreJingles()
-	{
-		if (previousJingleVolume != -1)
+		// Try to remove jingles from the active list
+		boolean removed = midiRequests.removeIf(MidiRequest::isJingle);
+		if (removed)
 		{
-			client.getVarps()[VarPlayerID.OPTION_JINGLES] = previousJingleVolume;
-			client.queueChangedVarp(VarPlayerID.OPTION_JINGLES);
-			previousJingleVolume = -1;
+			log.info("Removed jingle(s) from active MIDI requests");
 		}
 	}
 }
