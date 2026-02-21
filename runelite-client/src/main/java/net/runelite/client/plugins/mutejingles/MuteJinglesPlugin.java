@@ -24,15 +24,21 @@
  */
 package net.runelite.client.plugins.mutejingles;
 
+import java.io.InputStream;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import javax.inject.Inject;
+import javax.sound.midi.MidiSystem;
+import javax.sound.midi.Sequencer;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
-import net.runelite.api.MidiRequest;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
-import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.api.gameval.DBTableID;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
@@ -41,32 +47,180 @@ import net.runelite.client.plugins.PluginDescriptor;
 @Slf4j
 @PluginDescriptor(
 	name = "Mute Jingles",
-	description = "Mutes jingles (level up, quest complete, etc.) to prevent in-game music from restarting",
+	description = "Prevents jingles from interrupting in-game music by taking over music playback",
 	tags = {"sound", "music", "jingle", "volume", "mute"},
 	enabledByDefault = false
 )
 public class MuteJinglesPlugin extends Plugin
 {
+	private static final String MUSIC_RESOURCE_PATH = "/net/runelite/client/plugins/mutejingles/music/";
+
+	private static final int CURRENTLY_PLAYING_WIDGET_CHILD = 4;
+
 	@Inject
 	private Client client;
 
 	@Inject
 	private ClientThread clientThread;
 
+	private Sequencer sequencer;
+	private String currentSongName;
+	private int savedMusicVolume = -1;
+	private final Map<String, Integer> trackNameToArchiveId = new HashMap<>();
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		sequencer = MidiSystem.getSequencer();
+		sequencer.open();
+
+		clientThread.invokeLater(() ->
+		{
+			savedMusicVolume = client.getMusicVolume();
+			client.setMusicVolume(0);
+			log.info("Muted in-game music (was {})", savedMusicVolume);
+			buildTrackMapping();
+		});
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		stopPlayback();
+
+		if (sequencer != null)
+		{
+			sequencer.close();
+			sequencer = null;
+		}
+
+		currentSongName = null;
+		trackNameToArchiveId.clear();
+
+		clientThread.invokeLater(() ->
+		{
+			if (savedMusicVolume >= 0)
+			{
+				client.setMusicVolume(savedMusicVolume);
+				log.info("Restored in-game music volume to {}", savedMusicVolume);
+			}
+		});
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		if (event.getGameState() == GameState.LOGGED_IN && trackNameToArchiveId.isEmpty())
+		{
+			clientThread.invokeLater(this::buildTrackMapping);
+		}
+	}
+
+	private void buildTrackMapping()
+	{
+		trackNameToArchiveId.clear();
+
+		List<Integer> rows = client.getDBTableRows(DBTableID.Music.ID);
+		if (rows == null)
+		{
+			return;
+		}
+
+		for (int rowId : rows)
+		{
+			Object[] nameField = client.getDBTableField(rowId, DBTableID.Music.COL_DISPLAYNAME, 0);
+			Object[] midiField = client.getDBTableField(rowId, DBTableID.Music.COL_MIDI, 0);
+
+			if (nameField != null && nameField.length > 0 && midiField != null && midiField.length > 0)
+			{
+				String name = (String) nameField[0];
+				int archiveId = (int) midiField[0];
+				trackNameToArchiveId.put(name, archiveId);
+			}
+		}
+
+		log.info("Built track mapping: {} tracks", trackNameToArchiveId.size());
+	}
+
 	@Subscribe
 	public void onGameTick(GameTick gameTick)
 	{
-		List<MidiRequest> midiRequests = client.getActiveMidiRequests();
-		for (MidiRequest req : midiRequests)
+		// Keep in-game music muted
+		if (client.getMusicVolume() != 0)
 		{
-			log.info("Active MIDI: archiveId={}, isJingle={}", req.getArchiveId(), req.isJingle());
+			client.setMusicVolume(0);
 		}
 
-		// Try to remove jingles from the active list
-		boolean removed = midiRequests.removeIf(MidiRequest::isJingle);
-		if (removed)
+		// Read the currently playing track name from the music tab widget
+		Widget curTrackWidget = client.getWidget(InterfaceID.MUSIC, CURRENTLY_PLAYING_WIDGET_CHILD);
+		if (curTrackWidget == null)
 		{
-			log.info("Removed jingle(s) from active MIDI requests");
+			return;
+		}
+
+		String trackName = curTrackWidget.getText();
+		if (trackName == null || trackName.isEmpty())
+		{
+			return;
+		}
+
+		if (!trackName.equals(currentSongName))
+		{
+			Integer archiveId = trackNameToArchiveId.get(trackName);
+			if (archiveId != null)
+			{
+				String resourcePath = MUSIC_RESOURCE_PATH + archiveId + ".mid";
+				InputStream stream = getClass().getResourceAsStream(resourcePath);
+				if (stream != null)
+				{
+					log.info("Song changed: {} -> {} (archiveId={})", currentSongName, trackName, archiveId);
+					currentSongName = trackName;
+					playSong(stream);
+				}
+				else
+				{
+					log.warn("MIDI resource not found for {} (archiveId={}): {}", trackName, archiveId, resourcePath);
+				}
+			}
+			else
+			{
+				log.info("No archive ID mapping for track: '{}'", trackName);
+			}
+		}
+	}
+
+	private void playSong(InputStream stream)
+	{
+		stopPlayback();
+
+		try
+		{
+			sequencer.setSequence(stream);
+			sequencer.setLoopCount(Sequencer.LOOP_CONTINUOUSLY);
+			sequencer.start();
+			log.info("Playing song");
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to play MIDI", e);
+		}
+		finally
+		{
+			try
+			{
+				stream.close();
+			}
+			catch (Exception ignored)
+			{
+			}
+		}
+	}
+
+	private void stopPlayback()
+	{
+		if (sequencer != null && sequencer.isRunning())
+		{
+			sequencer.stop();
 		}
 	}
 }
