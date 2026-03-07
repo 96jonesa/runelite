@@ -46,13 +46,13 @@ public interface BaRaceConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "testAttackRole",
-		name = "Test attack role",
-		description = "Which role's attack effect to apply for test attacks",
+		keyName = "roleOverride",
+		name = "Role override",
+		description = "Override which role the plugin considers you as (for testing)",
 		position = 4
 	)
-	default TestAttackRole testAttackRole()
+	default RoleOverride roleOverride()
 	{
-		return TestAttackRole.ATTACKER;
+		return RoleOverride.CURRENT;
 	}
 }

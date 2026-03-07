@@ -12,4 +12,5 @@ public class BaRaceAttack extends PartyMemberMessage
 	private final String role;
 	// Duration in ticks. 0 means wave-based (until end of wave).
 	private final int durationTicks;
+	private final boolean test;
 }

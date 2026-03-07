@@ -98,7 +98,8 @@ public class BaRacePlugin extends Plugin
 	private boolean hasAttacked;
 	private boolean underAttack;
 	private boolean attackPending;
-	private int testAttackTicksRemaining;
+	private boolean isTestAttack;
+	private int ticksRemaining;
 
 	private final RenderCallback renderCallback = new RenderCallback()
 	{
@@ -170,7 +171,18 @@ public class BaRacePlugin extends Plugin
 		hasAttacked = false;
 		underAttack = false;
 		attackPending = false;
-		testAttackTicksRemaining = 0;
+		isTestAttack = false;
+		ticksRemaining = 0;
+	}
+
+	private String getEffectiveRole()
+	{
+		RoleOverride override = config.roleOverride();
+		if (override == RoleOverride.CURRENT)
+		{
+			return currentRole;
+		}
+		return override.name();
 	}
 
 	@Subscribe
@@ -241,14 +253,18 @@ public class BaRacePlugin extends Plugin
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		if (testAttackTicksRemaining > 0)
+		if (ticksRemaining > 0)
 		{
-			testAttackTicksRemaining--;
-			if (testAttackTicksRemaining == 0)
+			ticksRemaining--;
+			if (ticksRemaining == 0)
 			{
 				underAttack = false;
+				if (isTestAttack)
+				{
+					announceMessage("Test attack expired.");
+					isTestAttack = false;
+				}
 				activeAttackRole = null;
-				announceMessage("Test attack expired.");
 			}
 		}
 	}
@@ -359,32 +375,34 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
+		String effectiveRole = getEffectiveRole();
+
+		// Must match the receiver's effective role
+		if (effectiveRole == null || !effectiveRole.equals(attackerRole))
+		{
+			return;
+		}
+
+		activeAttackRole = attackerRole;
+
 		if (event.getDurationTicks() > 0)
 		{
-			// Test attack: applies to all opposing team members with the specified role's effect
+			// Tick-based attack
 			underAttack = true;
-			activeAttackRole = attackerRole;
-			testAttackTicksRemaining = event.getDurationTicks();
-			announceMessage("Under " + attackerRole.toLowerCase() + " attack for " + event.getDurationTicks() + " ticks!");
+			isTestAttack = event.isTest();
+			ticksRemaining = event.getDurationTicks();
+			if (event.isTest())
+			{
+				announceMessage("Under " + attackerRole.toLowerCase() + " attack for " + event.getDurationTicks() + " ticks!");
+			}
+		}
+		else if (inWave)
+		{
+			underAttack = true;
 		}
 		else
 		{
-			// Real attack: must match the receiver's current role
-			if (currentRole == null || !currentRole.equals(attackerRole))
-			{
-				return;
-			}
-
-			activeAttackRole = attackerRole;
-
-			if (inWave)
-			{
-				underAttack = true;
-			}
-			else
-			{
-				attackPending = true;
-			}
+			attackPending = true;
 		}
 	}
 
@@ -396,7 +414,8 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		if (currentRole == null)
+		String effectiveRole = getEffectiveRole();
+		if (effectiveRole == null)
 		{
 			announceMessage("You must be in a BA wave to trigger an attack.");
 			return;
@@ -410,10 +429,10 @@ public class BaRacePlugin extends Plugin
 
 		hasAttacked = true;
 
-		BaRaceAttack attack = new BaRaceAttack(config.team(), currentRole, 0);
+		BaRaceAttack attack = new BaRaceAttack(config.team(), effectiveRole, 0, false);
 		party.send(attack);
 
-		announceMessage("Attack sent! Opposing " + currentRole.toLowerCase() + "s will be disrupted.");
+		announceMessage("Attack sent! Opposing " + effectiveRole.toLowerCase() + "s will be disrupted.");
 	}
 
 	private void triggerTestAttack()
@@ -424,11 +443,17 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		String role = config.testAttackRole().getRoleKey();
-		BaRaceAttack attack = new BaRaceAttack(config.team(), role, TEST_ATTACK_TICKS);
+		String effectiveRole = getEffectiveRole();
+		if (effectiveRole == null)
+		{
+			announceMessage("You must set a role override or be in a BA wave to use test attacks.");
+			return;
+		}
+
+		BaRaceAttack attack = new BaRaceAttack(config.team(), effectiveRole, TEST_ATTACK_TICKS, true);
 		party.send(attack);
 
-		announceMessage("Test " + role.toLowerCase() + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
+		announceMessage("Test " + effectiveRole.toLowerCase() + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
 	}
 
 	private void announceMessage(String text)
