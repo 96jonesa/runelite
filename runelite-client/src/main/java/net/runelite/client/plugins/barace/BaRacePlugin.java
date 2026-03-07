@@ -3,6 +3,7 @@ package net.runelite.client.plugins.barace;
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Provides;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -92,12 +93,11 @@ public class BaRacePlugin extends Plugin
 	@Inject
 	private RenderCallbackManager renderCallbackManager;
 
-	private String currentRole;
-	private String activeAttackRole;
+	private Role currentRole;
+	private Attack activeAttack;
+	private Attack pendingAttack;
 	private boolean inWave;
 	private boolean hasAttacked;
-	private boolean underAttack;
-	private boolean attackPending;
 	private boolean isTestAttack;
 	private int ticksRemaining;
 
@@ -106,7 +106,7 @@ public class BaRacePlugin extends Plugin
 		@Override
 		public boolean addEntity(Renderable renderable, boolean ui)
 		{
-			if (underAttack && "DEFENDER".equals(activeAttackRole) && renderable instanceof NPC)
+			if (activeAttack == Attack.HIDE_RUNNERS && renderable instanceof NPC)
 			{
 				NPC npc = (NPC) renderable;
 				if (PENANCE_RUNNER_IDS.contains(npc.getId())
@@ -166,23 +166,39 @@ public class BaRacePlugin extends Plugin
 	private void resetState()
 	{
 		currentRole = null;
-		activeAttackRole = null;
+		activeAttack = null;
+		pendingAttack = null;
 		inWave = false;
 		hasAttacked = false;
-		underAttack = false;
-		attackPending = false;
 		isTestAttack = false;
 		ticksRemaining = 0;
 	}
 
-	private String getEffectiveRole()
+	private Role getEffectiveRole()
 	{
 		RoleOverride override = config.roleOverride();
 		if (override == RoleOverride.CURRENT)
 		{
 			return currentRole;
 		}
-		return override.name();
+		return override.getRole();
+	}
+
+	private static Attack defaultAttackForRole(Role role)
+	{
+		switch (role)
+		{
+			case ATTACKER:
+				return Attack.BLOCK_INVENTORY;
+			case COLLECTOR:
+				return Attack.JUNK_MENU_OPTIONS;
+			case HEALER:
+				return Attack.BLOCK_LEFT_CLICK_INVENTORY;
+			case DEFENDER:
+				return Attack.HIDE_RUNNERS;
+			default:
+				return Attack.JUNK_MENU_OPTIONS;
+		}
 	}
 
 	@Subscribe
@@ -191,19 +207,19 @@ public class BaRacePlugin extends Plugin
 		switch (event.getGroupId())
 		{
 			case InterfaceID.BARBASSAULT_OVER_ATT:
-				currentRole = "ATTACKER";
+				currentRole = Role.ATTACKER;
 				onWaveStart();
 				break;
 			case InterfaceID.BARBASSAULT_OVER_DEF:
-				currentRole = "DEFENDER";
+				currentRole = Role.DEFENDER;
 				onWaveStart();
 				break;
 			case InterfaceID.BARBASSAULT_OVER_HEAL:
-				currentRole = "HEALER";
+				currentRole = Role.HEALER;
 				onWaveStart();
 				break;
 			case InterfaceID.BARBASSAULT_OVER_COL:
-				currentRole = "COLLECTOR";
+				currentRole = Role.COLLECTOR;
 				onWaveStart();
 				break;
 		}
@@ -213,10 +229,10 @@ public class BaRacePlugin extends Plugin
 	{
 		inWave = true;
 
-		if (attackPending)
+		if (pendingAttack != null)
 		{
-			underAttack = true;
-			attackPending = false;
+			activeAttack = pendingAttack;
+			pendingAttack = null;
 		}
 	}
 
@@ -232,8 +248,8 @@ public class BaRacePlugin extends Plugin
 			if (wave.equals("1"))
 			{
 				hasAttacked = false;
-				underAttack = false;
-				attackPending = false;
+				activeAttack = null;
+				pendingAttack = null;
 			}
 		}
 	}
@@ -244,8 +260,7 @@ public class BaRacePlugin extends Plugin
 		if (event.getVarbitId() == VarbitID.BARBASSAULT_AREAEXIT_PENDING && event.getValue() == 0)
 		{
 			inWave = false;
-			underAttack = false;
-			activeAttackRole = null;
+			activeAttack = null;
 			currentRole = null;
 		}
 	}
@@ -258,13 +273,12 @@ public class BaRacePlugin extends Plugin
 			ticksRemaining--;
 			if (ticksRemaining == 0)
 			{
-				underAttack = false;
+				activeAttack = null;
 				if (isTestAttack)
 				{
 					announceMessage("Test attack expired.");
 					isTestAttack = false;
 				}
-				activeAttackRole = null;
 			}
 		}
 	}
@@ -273,7 +287,7 @@ public class BaRacePlugin extends Plugin
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
-		if (!underAttack || !"ATTACKER".equals(activeAttackRole))
+		if (activeAttack != Attack.BLOCK_INVENTORY)
 		{
 			return;
 		}
@@ -301,13 +315,12 @@ public class BaRacePlugin extends Plugin
 	@Subscribe
 	public void onMenuEntryAdded(MenuEntryAdded event)
 	{
-		if (!underAttack)
+		if (activeAttack == null)
 		{
 			return;
 		}
 
-		// Attacker attack: block inventory interactions by consuming the click
-		if ("ATTACKER".equals(activeAttackRole))
+		if (activeAttack == Attack.BLOCK_INVENTORY)
 		{
 			Widget widget = event.getMenuEntry().getWidget();
 			if (widget != null && WidgetUtil.componentToInterface(widget.getId()) == InterfaceID.INVENTORY)
@@ -317,8 +330,7 @@ public class BaRacePlugin extends Plugin
 			}
 		}
 
-		// Collector attack: add junk menu options
-		if ("COLLECTOR".equals(activeAttackRole) && "Walk here".equals(event.getOption()))
+		if (activeAttack == Attack.JUNK_MENU_OPTIONS && "Walk here".equals(event.getOption()))
 		{
 			for (String junkOption : JUNK_OPTIONS)
 			{
@@ -329,14 +341,12 @@ public class BaRacePlugin extends Plugin
 					.onClick(e -> {});
 			}
 		}
-
 	}
 
-	// Healer attack: consume left-click on inventory items, allow right-click
 	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
-		if (!underAttack || !"HEALER".equals(activeAttackRole))
+		if (activeAttack != Attack.BLOCK_LEFT_CLICK_INVENTORY)
 		{
 			return;
 		}
@@ -365,44 +375,40 @@ public class BaRacePlugin extends Plugin
 	@Subscribe
 	public void onBaRaceAttack(BaRaceAttack event)
 	{
-		int attackerTeam = event.getTeam();
-		String attackerRole = event.getRole();
-		int myTeam = config.team();
-
 		// Only affected if on the opposing team
-		if (attackerTeam == myTeam)
+		if (event.getTeam() == config.team())
 		{
 			return;
 		}
 
-		String effectiveRole = getEffectiveRole();
+		Role effectiveRole = getEffectiveRole();
 
-		// Must match the receiver's effective role
-		if (effectiveRole == null || !effectiveRole.equals(attackerRole))
+		// Must match one of the targeted roles
+		if (effectiveRole == null || !event.getRoles().contains(effectiveRole))
 		{
 			return;
 		}
 
-		activeAttackRole = attackerRole;
+		Attack attack = event.getAttack();
 
 		if (event.getDurationTicks() > 0)
 		{
 			// Tick-based attack
-			underAttack = true;
+			activeAttack = attack;
 			isTestAttack = event.isTest();
 			ticksRemaining = event.getDurationTicks();
 			if (event.isTest())
 			{
-				announceMessage("Under " + attackerRole.toLowerCase() + " attack for " + event.getDurationTicks() + " ticks!");
+				announceMessage("Under " + attack + " attack for " + event.getDurationTicks() + " ticks!");
 			}
 		}
 		else if (inWave)
 		{
-			underAttack = true;
+			activeAttack = attack;
 		}
 		else
 		{
-			attackPending = true;
+			pendingAttack = attack;
 		}
 	}
 
@@ -414,7 +420,7 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		String effectiveRole = getEffectiveRole();
+		Role effectiveRole = getEffectiveRole();
 		if (effectiveRole == null)
 		{
 			announceMessage("You must be in a BA wave to trigger an attack.");
@@ -429,10 +435,10 @@ public class BaRacePlugin extends Plugin
 
 		hasAttacked = true;
 
-		BaRaceAttack attack = new BaRaceAttack(config.team(), effectiveRole, 0, false);
+		BaRaceAttack attack = new BaRaceAttack(config.team(), Collections.singletonList(effectiveRole), defaultAttackForRole(effectiveRole), 0, false);
 		party.send(attack);
 
-		announceMessage("Attack sent! Opposing " + effectiveRole.toLowerCase() + "s will be disrupted.");
+		announceMessage("Attack sent! Opposing " + effectiveRole.name().toLowerCase() + "s will be disrupted.");
 	}
 
 	private void triggerTestAttack()
@@ -443,17 +449,17 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		String effectiveRole = getEffectiveRole();
+		Role effectiveRole = getEffectiveRole();
 		if (effectiveRole == null)
 		{
 			announceMessage("You must set a role override or be in a BA wave to use test attacks.");
 			return;
 		}
 
-		BaRaceAttack attack = new BaRaceAttack(config.team(), effectiveRole, TEST_ATTACK_TICKS, true);
+		BaRaceAttack attack = new BaRaceAttack(config.team(), Collections.singletonList(effectiveRole), defaultAttackForRole(effectiveRole), TEST_ATTACK_TICKS, true);
 		party.send(attack);
 
-		announceMessage("Test " + effectiveRole.toLowerCase() + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
+		announceMessage("Test " + effectiveRole.name().toLowerCase() + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
 	}
 
 	private void announceMessage(String text)
