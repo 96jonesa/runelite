@@ -17,6 +17,7 @@ import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.gameval.InterfaceID;
@@ -107,7 +108,8 @@ public class BaRacePlugin extends Plugin
 			if (underAttack && "DEFENDER".equals(activeAttackRole) && renderable instanceof NPC)
 			{
 				NPC npc = (NPC) renderable;
-				if (PENANCE_RUNNER_IDS.contains(npc.getId()))
+				if (PENANCE_RUNNER_IDS.contains(npc.getId())
+					|| "Private Pierreb".equals(npc.getName()))
 				{
 					return false;
 				}
@@ -288,6 +290,17 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
+		// Attacker attack: block inventory interactions by consuming the click
+		if ("ATTACKER".equals(activeAttackRole))
+		{
+			Widget widget = event.getMenuEntry().getWidget();
+			if (widget != null && WidgetUtil.componentToInterface(widget.getId()) == InterfaceID.INVENTORY)
+			{
+				event.getMenuEntry().setType(MenuAction.RUNELITE);
+				event.getMenuEntry().onClick(e -> {});
+			}
+		}
+
 		// Collector attack: add junk menu options
 		if ("COLLECTOR".equals(activeAttackRole) && "Walk here".equals(event.getOption()))
 		{
@@ -301,17 +314,22 @@ public class BaRacePlugin extends Plugin
 			}
 		}
 
-		// Healer attack: deprioritize left-click Use on targets
-		if ("HEALER".equals(activeAttackRole))
+	}
+
+	// Healer attack: consume left-click on inventory items, allow right-click
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		if (!underAttack || !"HEALER".equals(activeAttackRole))
 		{
-			MenuAction type = event.getMenuEntry().getType();
-			if (type == MenuAction.WIDGET_TARGET_ON_NPC
-				|| type == MenuAction.WIDGET_TARGET_ON_PLAYER
-				|| type == MenuAction.WIDGET_TARGET_ON_GAME_OBJECT
-				|| type == MenuAction.WIDGET_TARGET_ON_GROUND_ITEM)
-			{
-				event.getMenuEntry().setDeprioritized(true);
-			}
+			return;
+		}
+
+		Widget widget = event.getWidget();
+		if (widget != null && WidgetUtil.componentToInterface(widget.getId()) == InterfaceID.INVENTORY
+			&& !client.isMenuOpen())
+		{
+			event.consume();
 		}
 	}
 
