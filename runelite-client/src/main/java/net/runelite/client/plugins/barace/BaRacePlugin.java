@@ -1,19 +1,31 @@
 package net.runelite.client.plugins.barace;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.inject.Provides;
+import java.util.Arrays;
+import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.Renderable;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.NpcID;
 import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetUtil;
+import net.runelite.client.callback.RenderCallback;
+import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.chat.ChatColorType;
 import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.chat.ChatMessageManager;
@@ -46,6 +58,18 @@ public class BaRacePlugin extends Plugin
 
 	private static final int TEST_ATTACK_TICKS = 10;
 
+	private static final Set<Integer> PENANCE_RUNNER_IDS = ImmutableSet.of(
+		NpcID.BARBASSAULT_PEN_RUNNER_LV1,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV2,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV3,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV4,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV5,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV6,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV7,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV8,
+		NpcID.BARBASSAULT_PEN_RUNNER_LV9
+	);
+
 	@Inject
 	private Client client;
 
@@ -64,12 +88,33 @@ public class BaRacePlugin extends Plugin
 	@Inject
 	private KeyManager keyManager;
 
+	@Inject
+	private RenderCallbackManager renderCallbackManager;
+
 	private String currentRole;
+	private String activeAttackRole;
 	private boolean inWave;
 	private boolean hasAttacked;
 	private boolean underAttack;
 	private boolean attackPending;
 	private int testAttackTicksRemaining;
+
+	private final RenderCallback renderCallback = new RenderCallback()
+	{
+		@Override
+		public boolean addEntity(Renderable renderable, boolean ui)
+		{
+			if (underAttack && "DEFENDER".equals(activeAttackRole) && renderable instanceof NPC)
+			{
+				NPC npc = (NPC) renderable;
+				if (PENANCE_RUNNER_IDS.contains(npc.getId()))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+	};
 
 	private final HotkeyListener attackHotkeyListener = new HotkeyListener(() -> config.attackHotkey())
 	{
@@ -101,6 +146,7 @@ public class BaRacePlugin extends Plugin
 		wsClient.registerMessage(BaRaceAttack.class);
 		keyManager.registerKeyListener(attackHotkeyListener);
 		keyManager.registerKeyListener(testAttackHotkeyListener);
+		renderCallbackManager.register(renderCallback);
 		resetState();
 	}
 
@@ -110,12 +156,14 @@ public class BaRacePlugin extends Plugin
 		wsClient.unregisterMessage(BaRaceAttack.class);
 		keyManager.unregisterKeyListener(attackHotkeyListener);
 		keyManager.unregisterKeyListener(testAttackHotkeyListener);
+		renderCallbackManager.unregister(renderCallback);
 		resetState();
 	}
 
 	private void resetState()
 	{
 		currentRole = null;
+		activeAttackRole = null;
 		inWave = false;
 		hasAttacked = false;
 		underAttack = false;
@@ -155,7 +203,6 @@ public class BaRacePlugin extends Plugin
 		{
 			underAttack = true;
 			attackPending = false;
-			announceMessage("You are under attack! Extra menu options until end of wave.");
 		}
 	}
 
@@ -184,6 +231,7 @@ public class BaRacePlugin extends Plugin
 		{
 			inWave = false;
 			underAttack = false;
+			activeAttackRole = null;
 			currentRole = null;
 		}
 	}
@@ -197,8 +245,38 @@ public class BaRacePlugin extends Plugin
 			if (testAttackTicksRemaining == 0)
 			{
 				underAttack = false;
+				activeAttackRole = null;
 				announceMessage("Test attack expired.");
 			}
+		}
+	}
+
+	// Attacker attack: block all inventory interactions
+	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		if (!underAttack || !"ATTACKER".equals(activeAttackRole))
+		{
+			return;
+		}
+
+		MenuEntry[] menuEntries = client.getMenuEntries();
+		MenuEntry[] filtered = new MenuEntry[menuEntries.length];
+		int idx = 0;
+
+		for (MenuEntry entry : menuEntries)
+		{
+			Widget widget = entry.getWidget();
+			if (widget != null && WidgetUtil.componentToInterface(widget.getId()) == InterfaceID.INVENTORY)
+			{
+				continue;
+			}
+			filtered[idx++] = entry;
+		}
+
+		if (idx < menuEntries.length)
+		{
+			client.setMenuEntries(Arrays.copyOf(filtered, idx));
 		}
 	}
 
@@ -210,18 +288,30 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		if (!"Walk here".equals(event.getOption()))
+		// Collector attack: add junk menu options
+		if ("COLLECTOR".equals(activeAttackRole) && "Walk here".equals(event.getOption()))
 		{
-			return;
+			for (String junkOption : JUNK_OPTIONS)
+			{
+				client.createMenuEntry(-1)
+					.setOption(junkOption)
+					.setTarget(event.getTarget())
+					.setType(MenuAction.RUNELITE)
+					.onClick(e -> {});
+			}
 		}
 
-		for (String junkOption : JUNK_OPTIONS)
+		// Healer attack: deprioritize left-click Use on targets
+		if ("HEALER".equals(activeAttackRole))
 		{
-			client.createMenuEntry(-1)
-				.setOption(junkOption)
-				.setTarget(event.getTarget())
-				.setType(MenuAction.RUNELITE)
-				.onClick(e -> {});
+			MenuAction type = event.getMenuEntry().getType();
+			if (type == MenuAction.WIDGET_TARGET_ON_NPC
+				|| type == MenuAction.WIDGET_TARGET_ON_PLAYER
+				|| type == MenuAction.WIDGET_TARGET_ON_GAME_OBJECT
+				|| type == MenuAction.WIDGET_TARGET_ON_GROUND_ITEM)
+			{
+				event.getMenuEntry().setDeprioritized(true);
+			}
 		}
 	}
 
@@ -251,31 +341,32 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		// "ALL" targets every role, otherwise must match
-		boolean roleMatches = "ALL".equals(attackerRole)
-			|| (currentRole != null && currentRole.equals(attackerRole));
-
-		if (!roleMatches)
-		{
-			return;
-		}
-
 		if (event.getDurationTicks() > 0)
 		{
-			// Tick-based attack (e.g. test command)
+			// Test attack: applies to all opposing team members with the specified role's effect
 			underAttack = true;
+			activeAttackRole = attackerRole;
 			testAttackTicksRemaining = event.getDurationTicks();
-			announceMessage("Under attack for " + event.getDurationTicks() + " ticks!");
-		}
-		else if (inWave)
-		{
-			underAttack = true;
-			announceMessage("You are under attack! Extra menu options until end of wave.");
+			announceMessage("Under " + attackerRole.toLowerCase() + " attack for " + event.getDurationTicks() + " ticks!");
 		}
 		else
 		{
-			attackPending = true;
-			announceMessage("Attack incoming! Extra menu options will apply next wave.");
+			// Real attack: must match the receiver's current role
+			if (currentRole == null || !currentRole.equals(attackerRole))
+			{
+				return;
+			}
+
+			activeAttackRole = attackerRole;
+
+			if (inWave)
+			{
+				underAttack = true;
+			}
+			else
+			{
+				attackPending = true;
+			}
 		}
 	}
 
@@ -315,10 +406,11 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		BaRaceAttack attack = new BaRaceAttack(config.team(), "ALL", TEST_ATTACK_TICKS);
+		String role = config.testAttackRole().getRoleKey();
+		BaRaceAttack attack = new BaRaceAttack(config.team(), role, TEST_ATTACK_TICKS);
 		party.send(attack);
 
-		announceMessage("Test attack sent to all opposing team members for " + TEST_ATTACK_TICKS + " ticks.");
+		announceMessage("Test " + role.toLowerCase() + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
 	}
 
 	private void announceMessage(String text)

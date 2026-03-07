@@ -37,11 +37,22 @@ public interface BaRaceConfig extends Config
 	@ConfigItem(
 		keyName = "testAttackHotkey",
 		name = "Test attack hotkey",
-		description = "Key to trigger a test attack (10 ticks, all roles, no restrictions)",
+		description = "Key to trigger a test attack (10 ticks, no restrictions)",
 		position = 3
 	)
 	default Keybind testAttackHotkey()
 	{
 		return Keybind.NOT_SET;
+	}
+
+	@ConfigItem(
+		keyName = "testAttackRole",
+		name = "Test attack role",
+		description = "Which role's attack effect to apply for test attacks",
+		position = 4
+	)
+	default TestAttackRole testAttackRole()
+	{
+		return TestAttackRole.ATTACKER;
 	}
 }
