@@ -24,6 +24,7 @@
  */
 package net.runelite.client.plugins.mutejingles;
 
+import java.io.BufferedInputStream;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.List;
@@ -31,6 +32,11 @@ import java.util.Map;
 import javax.inject.Inject;
 import javax.sound.midi.MidiSystem;
 import javax.sound.midi.Sequencer;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Clip;
+import javax.sound.sampled.DataLine;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -64,6 +70,8 @@ public class MuteJinglesPlugin extends Plugin
 	private ClientThread clientThread;
 
 	private Sequencer sequencer;
+	private Clip oggClip;
+	private boolean playingOgg;
 	private String currentSongName;
 	private int savedMusicVolume = -1;
 	private final Map<String, Integer> trackNameToArchiveId = new HashMap<>();
@@ -169,17 +177,29 @@ public class MuteJinglesPlugin extends Plugin
 			Integer archiveId = trackNameToArchiveId.get(trackName);
 			if (archiveId != null)
 			{
-				String resourcePath = MUSIC_RESOURCE_PATH + archiveId + ".mid";
-				InputStream stream = getClass().getResourceAsStream(resourcePath);
-				if (stream != null)
+				// Try OGG first, then fall back to MIDI
+				String oggPath = MUSIC_RESOURCE_PATH + archiveId + ".ogg";
+				InputStream oggStream = getClass().getResourceAsStream(oggPath);
+				if (oggStream != null)
 				{
-					log.info("Song changed: {} -> {} (archiveId={})", currentSongName, trackName, archiveId);
+					log.info("Song changed: {} -> {} (archiveId={}, format=ogg)", currentSongName, trackName, archiveId);
 					currentSongName = trackName;
-					playSong(stream);
+					playOggSong(oggStream);
 				}
 				else
 				{
-					log.warn("MIDI resource not found for {} (archiveId={}): {}", trackName, archiveId, resourcePath);
+					String midiPath = MUSIC_RESOURCE_PATH + archiveId + ".mid";
+					InputStream midiStream = getClass().getResourceAsStream(midiPath);
+					if (midiStream != null)
+					{
+						log.info("Song changed: {} -> {} (archiveId={}, format=midi)", currentSongName, trackName, archiveId);
+						currentSongName = trackName;
+						playMidiSong(midiStream);
+					}
+					else
+					{
+						log.warn("No audio resource found for {} (archiveId={})", trackName, archiveId);
+					}
 				}
 			}
 			else
@@ -189,7 +209,41 @@ public class MuteJinglesPlugin extends Plugin
 		}
 	}
 
-	private void playSong(InputStream stream)
+	private void playOggSong(InputStream stream)
+	{
+		stopPlayback();
+
+		try
+		{
+			BufferedInputStream buffered = new BufferedInputStream(stream);
+			AudioInputStream oggStream = AudioSystem.getAudioInputStream(buffered);
+
+			// Decode to PCM
+			AudioFormat baseFormat = oggStream.getFormat();
+			AudioFormat decodedFormat = new AudioFormat(
+				AudioFormat.Encoding.PCM_SIGNED,
+				baseFormat.getSampleRate(),
+				16,
+				baseFormat.getChannels(),
+				baseFormat.getChannels() * 2,
+				baseFormat.getSampleRate(),
+				false
+			);
+			AudioInputStream decodedStream = AudioSystem.getAudioInputStream(decodedFormat, oggStream);
+
+			oggClip = AudioSystem.getClip();
+			oggClip.open(decodedStream);
+			oggClip.loop(Clip.LOOP_CONTINUOUSLY);
+			playingOgg = true;
+			log.info("Playing OGG song");
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to play OGG", e);
+		}
+	}
+
+	private void playMidiSong(InputStream stream)
 	{
 		stopPlayback();
 
@@ -198,7 +252,8 @@ public class MuteJinglesPlugin extends Plugin
 			sequencer.setSequence(stream);
 			sequencer.setLoopCount(Sequencer.LOOP_CONTINUOUSLY);
 			sequencer.start();
-			log.info("Playing song");
+			playingOgg = false;
+			log.info("Playing MIDI song");
 		}
 		catch (Exception e)
 		{
@@ -218,9 +273,18 @@ public class MuteJinglesPlugin extends Plugin
 
 	private void stopPlayback()
 	{
+		if (oggClip != null)
+		{
+			oggClip.stop();
+			oggClip.close();
+			oggClip = null;
+		}
+
 		if (sequencer != null && sequencer.isRunning())
 		{
 			sequencer.stop();
 		}
+
+		playingOgg = false;
 	}
 }

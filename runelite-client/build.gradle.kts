@@ -77,6 +77,7 @@ dependencies {
     api(libs.findbugs)
     compileOnly(libs.jetbrains.annotations)
     api(libs.protobuf)
+    implementation(libs.vorbisspi)
     api(libs.lwjgl.core)
     api(libs.lwjgl.opengl)
     api(libs.lwjgl.opencl)
