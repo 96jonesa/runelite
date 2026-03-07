@@ -20,10 +20,12 @@ import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.input.KeyManager;
 import net.runelite.client.party.PartyService;
 import net.runelite.client.party.WSClient;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.util.HotkeyListener;
 
 @PluginDescriptor(
 	name = "BA Race",
@@ -42,6 +44,8 @@ public class BaRacePlugin extends Plugin
 		"Reconfigure"
 	};
 
+	private static final int TEST_ATTACK_TICKS = 10;
+
 	@Inject
 	private Client client;
 
@@ -57,7 +61,8 @@ public class BaRacePlugin extends Plugin
 	@Inject
 	private ChatMessageManager chatMessageManager;
 
-	private static final int TEST_ATTACK_TICKS = 10;
+	@Inject
+	private KeyManager keyManager;
 
 	private String currentRole;
 	private boolean inWave;
@@ -65,6 +70,24 @@ public class BaRacePlugin extends Plugin
 	private boolean underAttack;
 	private boolean attackPending;
 	private int testAttackTicksRemaining;
+
+	private final HotkeyListener attackHotkeyListener = new HotkeyListener(() -> config.attackHotkey())
+	{
+		@Override
+		public void hotkeyPressed()
+		{
+			triggerAttack();
+		}
+	};
+
+	private final HotkeyListener testAttackHotkeyListener = new HotkeyListener(() -> config.testAttackHotkey())
+	{
+		@Override
+		public void hotkeyPressed()
+		{
+			triggerTestAttack();
+		}
+	};
 
 	@Provides
 	BaRaceConfig provideConfig(ConfigManager configManager)
@@ -76,6 +99,8 @@ public class BaRacePlugin extends Plugin
 	protected void startUp()
 	{
 		wsClient.registerMessage(BaRaceAttack.class);
+		keyManager.registerKeyListener(attackHotkeyListener);
+		keyManager.registerKeyListener(testAttackHotkeyListener);
 		resetState();
 	}
 
@@ -83,6 +108,8 @@ public class BaRacePlugin extends Plugin
 	protected void shutDown()
 	{
 		wsClient.unregisterMessage(BaRaceAttack.class);
+		keyManager.unregisterKeyListener(attackHotkeyListener);
+		keyManager.unregisterKeyListener(testAttackHotkeyListener);
 		resetState();
 	}
 
@@ -183,9 +210,6 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		// Only add junk options on the first real menu entry per menu open
-		// to avoid adding them repeatedly. We add them when we see "Walk here"
-		// which is typically the last (bottom) entry added.
 		if (!"Walk here".equals(event.getOption()))
 		{
 			return;
