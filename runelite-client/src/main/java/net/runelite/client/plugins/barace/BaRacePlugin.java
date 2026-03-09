@@ -34,8 +34,10 @@ import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.ExternalPluginsChanged;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.party.PartyService;
 import net.runelite.client.party.WSClient;
@@ -102,6 +104,9 @@ public class BaRacePlugin extends Plugin
 
 	@Inject
 	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private EventBus eventBus;
 
 	@Inject
 	private KeyManager keyManager;
@@ -381,6 +386,9 @@ public class BaRacePlugin extends Plugin
 		{
 			ignoreConfigChange = false;
 		}
+
+		// Trigger ConfigPanel rebuild so the UI reflects the remote update
+		eventBus.post(new ExternalPluginsChanged());
 
 		String targets = event.getTargetRoles().stream()
 			.map(r -> r.name().toLowerCase())
