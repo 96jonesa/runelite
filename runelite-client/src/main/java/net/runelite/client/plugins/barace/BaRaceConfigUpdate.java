@@ -7,12 +7,10 @@ import net.runelite.client.party.messages.PartyMemberMessage;
 
 @Data
 @EqualsAndHashCode(callSuper = true)
-public class BaRaceAttack extends PartyMemberMessage
+public class BaRaceConfigUpdate extends PartyMemberMessage
 {
-	private final int team;
-	private final Set<Role> roles;
+	private final Role role;
 	private final Attack attack;
-	// Duration in ticks. 0 means wave-based (until end of wave).
 	private final int durationTicks;
-	private final boolean test;
+	private final Set<Role> targetRoles;
 }

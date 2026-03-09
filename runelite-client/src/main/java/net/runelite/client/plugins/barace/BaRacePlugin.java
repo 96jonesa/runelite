@@ -3,8 +3,9 @@ package net.runelite.client.plugins.barace;
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Provides;
 import java.util.Arrays;
-import java.util.Collections;
+import java.util.EnumSet;
 import java.util.Set;
+import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
@@ -34,6 +35,7 @@ import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.party.PartyService;
 import net.runelite.client.party.WSClient;
@@ -72,11 +74,25 @@ public class BaRacePlugin extends Plugin
 		NpcID.BARBASSAULT_PEN_RUNNER_LV9
 	);
 
+	private static final Set<String> ATTACK_CONFIG_KEYS = ImmutableSet.of(
+		"attackerAttack", "attackerDuration",
+		"attackerTargetAttacker", "attackerTargetCollector", "attackerTargetHealer", "attackerTargetDefender",
+		"collectorAttack", "collectorDuration",
+		"collectorTargetAttacker", "collectorTargetCollector", "collectorTargetHealer", "collectorTargetDefender",
+		"healerAttack", "healerDuration",
+		"healerTargetAttacker", "healerTargetCollector", "healerTargetHealer", "healerTargetDefender",
+		"defenderAttack", "defenderDuration",
+		"defenderTargetAttacker", "defenderTargetCollector", "defenderTargetHealer", "defenderTargetDefender"
+	);
+
 	@Inject
 	private Client client;
 
 	@Inject
 	private BaRaceConfig config;
+
+	@Inject
+	private ConfigManager configManager;
 
 	@Inject
 	private PartyService party;
@@ -100,6 +116,7 @@ public class BaRacePlugin extends Plugin
 	private boolean hasAttacked;
 	private boolean isTestAttack;
 	private int ticksRemaining;
+	private boolean ignoreConfigChange;
 
 	private final RenderCallback renderCallback = new RenderCallback()
 	{
@@ -147,6 +164,7 @@ public class BaRacePlugin extends Plugin
 	protected void startUp()
 	{
 		wsClient.registerMessage(BaRaceAttack.class);
+		wsClient.registerMessage(BaRaceConfigUpdate.class);
 		keyManager.registerKeyListener(attackHotkeyListener);
 		keyManager.registerKeyListener(testAttackHotkeyListener);
 		renderCallbackManager.register(renderCallback);
@@ -157,6 +175,7 @@ public class BaRacePlugin extends Plugin
 	protected void shutDown()
 	{
 		wsClient.unregisterMessage(BaRaceAttack.class);
+		wsClient.unregisterMessage(BaRaceConfigUpdate.class);
 		keyManager.unregisterKeyListener(attackHotkeyListener);
 		keyManager.unregisterKeyListener(testAttackHotkeyListener);
 		renderCallbackManager.unregister(renderCallback);
@@ -184,22 +203,195 @@ public class BaRacePlugin extends Plugin
 		return override.getRole();
 	}
 
-	private static Attack defaultAttackForRole(Role role)
+	private Attack getAttackForRole(Role role)
 	{
 		switch (role)
 		{
 			case ATTACKER:
-				return Attack.BLOCK_INVENTORY;
+				return config.attackerAttack();
 			case COLLECTOR:
-				return Attack.JUNK_MENU_OPTIONS;
+				return config.collectorAttack();
 			case HEALER:
-				return Attack.BLOCK_LEFT_CLICK_INVENTORY;
+				return config.healerAttack();
 			case DEFENDER:
-				return Attack.HIDE_RUNNERS;
+				return config.defenderAttack();
 			default:
 				return Attack.JUNK_MENU_OPTIONS;
 		}
 	}
+
+	private int getDurationForRole(Role role)
+	{
+		switch (role)
+		{
+			case ATTACKER:
+				return config.attackerDuration();
+			case COLLECTOR:
+				return config.collectorDuration();
+			case HEALER:
+				return config.healerDuration();
+			case DEFENDER:
+				return config.defenderDuration();
+			default:
+				return 0;
+		}
+	}
+
+	private Set<Role> getTargetsForRole(Role role)
+	{
+		boolean att, col, heal, def;
+		switch (role)
+		{
+			case ATTACKER:
+				att = config.attackerTargetAttacker();
+				col = config.attackerTargetCollector();
+				heal = config.attackerTargetHealer();
+				def = config.attackerTargetDefender();
+				break;
+			case COLLECTOR:
+				att = config.collectorTargetAttacker();
+				col = config.collectorTargetCollector();
+				heal = config.collectorTargetHealer();
+				def = config.collectorTargetDefender();
+				break;
+			case HEALER:
+				att = config.healerTargetAttacker();
+				col = config.healerTargetCollector();
+				heal = config.healerTargetHealer();
+				def = config.healerTargetDefender();
+				break;
+			case DEFENDER:
+				att = config.defenderTargetAttacker();
+				col = config.defenderTargetCollector();
+				heal = config.defenderTargetHealer();
+				def = config.defenderTargetDefender();
+				break;
+			default:
+				return EnumSet.noneOf(Role.class);
+		}
+
+		EnumSet<Role> targets = EnumSet.noneOf(Role.class);
+		if (att) targets.add(Role.ATTACKER);
+		if (col) targets.add(Role.COLLECTOR);
+		if (heal) targets.add(Role.HEALER);
+		if (def) targets.add(Role.DEFENDER);
+		return targets;
+	}
+
+	private Role roleForConfigKey(String key)
+	{
+		if (key.startsWith("attacker"))
+		{
+			return Role.ATTACKER;
+		}
+		if (key.startsWith("collector"))
+		{
+			return Role.COLLECTOR;
+		}
+		if (key.startsWith("healer"))
+		{
+			return Role.HEALER;
+		}
+		if (key.startsWith("defender"))
+		{
+			return Role.DEFENDER;
+		}
+		return null;
+	}
+
+	// --- Party config sync ---
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!BaRaceConfig.GROUP.equals(event.getGroup()) || ignoreConfigChange)
+		{
+			return;
+		}
+
+		if (!ATTACK_CONFIG_KEYS.contains(event.getKey()))
+		{
+			return;
+		}
+
+		if (!party.isInParty())
+		{
+			return;
+		}
+
+		Role role = roleForConfigKey(event.getKey());
+		if (role == null)
+		{
+			return;
+		}
+
+		BaRaceConfigUpdate update = new BaRaceConfigUpdate(
+			role,
+			getAttackForRole(role),
+			getDurationForRole(role),
+			getTargetsForRole(role)
+		);
+		party.send(update);
+	}
+
+	@Subscribe
+	public void onBaRaceConfigUpdate(BaRaceConfigUpdate event)
+	{
+		ignoreConfigChange = true;
+		try
+		{
+			Set<Role> targets = event.getTargetRoles();
+			switch (event.getRole())
+			{
+				case ATTACKER:
+					config.setAttackerAttack(event.getAttack());
+					config.setAttackerDuration(event.getDurationTicks());
+					config.setAttackerTargetAttacker(targets.contains(Role.ATTACKER));
+					config.setAttackerTargetCollector(targets.contains(Role.COLLECTOR));
+					config.setAttackerTargetHealer(targets.contains(Role.HEALER));
+					config.setAttackerTargetDefender(targets.contains(Role.DEFENDER));
+					break;
+				case COLLECTOR:
+					config.setCollectorAttack(event.getAttack());
+					config.setCollectorDuration(event.getDurationTicks());
+					config.setCollectorTargetAttacker(targets.contains(Role.ATTACKER));
+					config.setCollectorTargetCollector(targets.contains(Role.COLLECTOR));
+					config.setCollectorTargetHealer(targets.contains(Role.HEALER));
+					config.setCollectorTargetDefender(targets.contains(Role.DEFENDER));
+					break;
+				case HEALER:
+					config.setHealerAttack(event.getAttack());
+					config.setHealerDuration(event.getDurationTicks());
+					config.setHealerTargetAttacker(targets.contains(Role.ATTACKER));
+					config.setHealerTargetCollector(targets.contains(Role.COLLECTOR));
+					config.setHealerTargetHealer(targets.contains(Role.HEALER));
+					config.setHealerTargetDefender(targets.contains(Role.DEFENDER));
+					break;
+				case DEFENDER:
+					config.setDefenderAttack(event.getAttack());
+					config.setDefenderDuration(event.getDurationTicks());
+					config.setDefenderTargetAttacker(targets.contains(Role.ATTACKER));
+					config.setDefenderTargetCollector(targets.contains(Role.COLLECTOR));
+					config.setDefenderTargetHealer(targets.contains(Role.HEALER));
+					config.setDefenderTargetDefender(targets.contains(Role.DEFENDER));
+					break;
+			}
+		}
+		finally
+		{
+			ignoreConfigChange = false;
+		}
+
+		String targets = event.getTargetRoles().stream()
+			.map(r -> r.name().toLowerCase())
+			.collect(Collectors.joining(", "));
+		String duration = event.getDurationTicks() == 0 ? "wave-based" : event.getDurationTicks() + " ticks";
+
+		announceMessage(event.getRole().name().toLowerCase() + " config updated: "
+			+ event.getAttack() + ", " + duration + ", targets: " + targets);
+	}
+
+	// --- Wave/role tracking ---
 
 	@Subscribe
 	public void onWidgetLoaded(WidgetLoaded event)
@@ -283,7 +475,8 @@ public class BaRacePlugin extends Plugin
 		}
 	}
 
-	// Attacker attack: block all inventory interactions
+	// --- Attack effects ---
+
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
@@ -359,6 +552,8 @@ public class BaRacePlugin extends Plugin
 		}
 	}
 
+	// --- Commands ---
+
 	@Subscribe
 	public void onCommandExecuted(CommandExecuted event)
 	{
@@ -371,6 +566,8 @@ public class BaRacePlugin extends Plugin
 			triggerTestAttack();
 		}
 	}
+
+	// --- Receiving attacks ---
 
 	@Subscribe
 	public void onBaRaceAttack(BaRaceAttack event)
@@ -412,6 +609,8 @@ public class BaRacePlugin extends Plugin
 		}
 	}
 
+	// --- Sending attacks ---
+
 	public void triggerAttack()
 	{
 		if (!party.isInParty())
@@ -435,10 +634,15 @@ public class BaRacePlugin extends Plugin
 
 		hasAttacked = true;
 
-		BaRaceAttack attack = new BaRaceAttack(config.team(), Collections.singletonList(effectiveRole), defaultAttackForRole(effectiveRole), 0, false);
-		party.send(attack);
+		Attack attack = getAttackForRole(effectiveRole);
+		int duration = getDurationForRole(effectiveRole);
+		Set<Role> targets = getTargetsForRole(effectiveRole);
 
-		announceMessage("Attack sent! Opposing " + effectiveRole.name().toLowerCase() + "s will be disrupted.");
+		BaRaceAttack msg = new BaRaceAttack(config.team(), targets, attack, duration, false);
+		party.send(msg);
+
+		announceMessage("Attack sent! " + attack + " targeting opposing "
+			+ targets.stream().map(r -> r.name().toLowerCase()).collect(Collectors.joining(", ")) + ".");
 	}
 
 	private void triggerTestAttack()
@@ -456,10 +660,13 @@ public class BaRacePlugin extends Plugin
 			return;
 		}
 
-		BaRaceAttack attack = new BaRaceAttack(config.team(), Collections.singletonList(effectiveRole), defaultAttackForRole(effectiveRole), TEST_ATTACK_TICKS, true);
-		party.send(attack);
+		Attack attack = getAttackForRole(effectiveRole);
+		Set<Role> targets = getTargetsForRole(effectiveRole);
 
-		announceMessage("Test " + effectiveRole.name().toLowerCase() + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
+		BaRaceAttack msg = new BaRaceAttack(config.team(), targets, attack, TEST_ATTACK_TICKS, true);
+		party.send(msg);
+
+		announceMessage("Test " + attack + " attack sent for " + TEST_ATTACK_TICKS + " ticks.");
 	}
 
 	private void announceMessage(String text)
