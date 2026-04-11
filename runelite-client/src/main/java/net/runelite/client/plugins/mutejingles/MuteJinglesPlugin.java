@@ -30,20 +30,25 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import javax.inject.Inject;
+import javax.sound.midi.MidiChannel;
 import javax.sound.midi.MidiSystem;
 import javax.sound.midi.Sequencer;
+import javax.sound.midi.Synthesizer;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.Clip;
 import javax.sound.sampled.DataLine;
+import javax.sound.sampled.FloatControl;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.gameval.DBTableID;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
@@ -122,6 +127,15 @@ public class MuteJinglesPlugin extends Plugin
 		{
 			clientThread.invokeLater(this::buildTrackMapping);
 		}
+		else if (event.getGameState() == GameState.LOGIN_SCREEN)
+		{
+			stopPlayback();
+			currentSongName = null;
+			if (savedMusicVolume >= 0)
+			{
+				client.setMusicVolume(savedMusicVolume);
+			}
+		}
 	}
 
 	private void buildTrackMapping()
@@ -151,12 +165,24 @@ public class MuteJinglesPlugin extends Plugin
 	}
 
 	@Subscribe
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		if (event.getVarpId() == VarPlayerID.OPTION_MASTER_VOLUME)
+		{
+			applyVolume();
+		}
+	}
+
+	@Subscribe
 	public void onGameTick(GameTick gameTick)
 	{
-		// Keep in-game music muted
-		if (client.getMusicVolume() != 0)
+		// Capture volume changes from the user, then mute the game
+		int vol = client.getMusicVolume();
+		if (vol != 0)
 		{
+			savedMusicVolume = vol;
 			client.setMusicVolume(0);
+			applyVolume();
 		}
 
 		// Read the currently playing track name from the music tab widget
@@ -237,6 +263,7 @@ public class MuteJinglesPlugin extends Plugin
 			oggClip.open(decodedStream);
 			oggClip.loop(Clip.LOOP_CONTINUOUSLY);
 			playingOgg = true;
+			applyVolume();
 			log.info("Playing OGG song");
 		}
 		catch (Exception e)
@@ -255,6 +282,7 @@ public class MuteJinglesPlugin extends Plugin
 			sequencer.setLoopCount(Sequencer.LOOP_CONTINUOUSLY);
 			sequencer.start();
 			playingOgg = false;
+			applyVolume();
 			log.info("Playing MIDI song");
 		}
 		catch (Exception e)
@@ -269,6 +297,44 @@ public class MuteJinglesPlugin extends Plugin
 			}
 			catch (Exception ignored)
 			{
+			}
+		}
+	}
+
+	private void applyVolume()
+	{
+		// Combine music volume (0-255) with master volume (0-255)
+		int masterVolume = client.getVarpValue(VarPlayerID.OPTION_MASTER_VOLUME);
+		float fraction = (savedMusicVolume / 255f) * (masterVolume / 255f);
+
+		if (playingOgg && oggClip != null && oggClip.isOpen())
+		{
+			FloatControl gain = (FloatControl) oggClip.getControl(FloatControl.Type.MASTER_GAIN);
+			if (fraction <= 0f)
+			{
+				gain.setValue(gain.getMinimum());
+			}
+			else
+			{
+				// Convert linear fraction to dB: 20 * log10(fraction)
+				float dB = (float) (20.0 * Math.log10(fraction));
+				gain.setValue(Math.max(dB, gain.getMinimum()));
+			}
+		}
+
+		if (!playingOgg && sequencer != null && sequencer.isOpen())
+		{
+			// MIDI volume via channel controller 7 (0-127)
+			int midiVol = (int) (fraction * 127);
+			if (sequencer instanceof Synthesizer)
+			{
+				for (MidiChannel ch : ((Synthesizer) sequencer).getChannels())
+				{
+					if (ch != null)
+					{
+						ch.controlChange(7, midiVol);
+					}
+				}
 			}
 		}
 	}
