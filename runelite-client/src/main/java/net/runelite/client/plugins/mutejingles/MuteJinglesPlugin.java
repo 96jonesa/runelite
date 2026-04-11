@@ -174,19 +174,21 @@ public class MuteJinglesPlugin extends Plugin
 
 		if (!trackName.equals(currentSongName))
 		{
-			Integer archiveId = trackNameToArchiveId.get(trackName);
-			if (archiveId != null)
+			// Try OGG by track name first
+			String oggName = trackName.replace(' ', '_') + ".ogg";
+			String oggPath = MUSIC_RESOURCE_PATH + oggName;
+			InputStream oggStream = getClass().getResourceAsStream(oggPath);
+			if (oggStream != null)
 			{
-				// Try OGG first, then fall back to MIDI
-				String oggPath = MUSIC_RESOURCE_PATH + archiveId + ".ogg";
-				InputStream oggStream = getClass().getResourceAsStream(oggPath);
-				if (oggStream != null)
-				{
-					log.info("Song changed: {} -> {} (archiveId={}, format=ogg)", currentSongName, trackName, archiveId);
-					currentSongName = trackName;
-					playOggSong(oggStream);
-				}
-				else
+				log.info("Song changed: {} -> {} (format=ogg)", currentSongName, trackName);
+				currentSongName = trackName;
+				playOggSong(oggStream);
+			}
+			else
+			{
+				// Fall back to MIDI by archive ID
+				Integer archiveId = trackNameToArchiveId.get(trackName);
+				if (archiveId != null)
 				{
 					String midiPath = MUSIC_RESOURCE_PATH + archiveId + ".mid";
 					InputStream midiStream = getClass().getResourceAsStream(midiPath);
@@ -201,10 +203,10 @@ public class MuteJinglesPlugin extends Plugin
 						log.warn("No audio resource found for {} (archiveId={})", trackName, archiveId);
 					}
 				}
-			}
-			else
-			{
-				log.info("No archive ID mapping for track: '{}'", trackName);
+				else
+				{
+					log.info("No audio resource for track: '{}'", trackName);
+				}
 			}
 		}
 	}
