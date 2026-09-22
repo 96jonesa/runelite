@@ -190,11 +190,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private SceneUploader clientUploader, mapUploader;
 	private DeferredZoneUploader deferredUploader;
-	// CPU memory the loader writes a scene's vertex data into; reused across loads, grown when a scene
-	// needs more. Only touched by the thread running loadScene.
+	// CPU memory the client thread writes zone vertex data into before committing it to GL: the near zones
+	// at swap, one zone at a time in rebuild. Grown when a scene needs more.
 	private IntBuffer stagingArena;
-	// the same for rebuild, which stages one zone at a time on the client thread
-	private IntBuffer rebuildArena;
 
 	// timing of the client's part of a scene load, for the debug log
 	private volatile long loadSceneDoneNanos;
@@ -260,8 +258,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private SceneContext root;
 	private SceneContext[] subs;
-	private Zone[][] nextZones;
-	private Map<Integer, Integer> nextRoofChanges;
+
+	// handed from loadScene (map loader thread) to swapScene (client thread) by the client's own load
+	// handoff, the same way the built scene itself is
+	private volatile Scene nextScene;
+	private volatile Scene nextPrevScene;
+	private volatile GameState nextGameState;
 
 	// Uniforms
 	private int uniUseFog;
@@ -470,7 +472,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				deferredUploader.shutdown();
 			}
 			stagingArena = null;
-			rebuildArena = null;
 
 			if (lwjglInitted)
 			{
@@ -1435,12 +1436,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				Scene scene = wv.getScene();
 				clientUploader.zoneSize(scene, zone, x, z);
 				int stagingInts = zone.stagingInts();
-				if (rebuildArena == null || rebuildArena.capacity() < stagingInts)
+				if (stagingArena == null || stagingArena.capacity() < stagingInts)
 				{
-					rebuildArena = GpuIntBuffer.allocateDirect(stagingInts);
+					stagingArena = GpuIntBuffer.allocateDirect(stagingInts);
 				}
-				rebuildArena.clear();
-				zone.stage(rebuildArena);
+				stagingArena.clear();
+				zone.stage(stagingArena);
 				clientUploader.uploadZone(scene, zone, x, z);
 				zone.commit();
 				zone.initialized = true;
@@ -1697,49 +1698,143 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		Stopwatch swLoad = Stopwatch.createStarted();
+		// The client calls this on its map loader thread and only notices that the build has finished once
+		// per game cycle, so anything done here is rounded up to that cycle. Record what the swap needs and
+		// return: the plugin's whole share of a load happens in swapScene, on the client thread, after the
+		// client has noticed. The world view still points at the outgoing scene here; by the swap it may not.
+		nextPrevScene = client.getTopLevelWorldView().getScene();
+		nextGameState = client.getGameState();
+		nextScene = scene;
+		loadSceneDoneNanos = System.nanoTime();
+	}
+
+	private static boolean canReuse(Zone[][] zones, int zx, int zz)
+	{
+		// For tile blending, sharelight, and shadows to work correctly, the zones surrounding
+		// the zone must be valid.
+		for (int x = zx - 1; x <= zx + 1; ++x)
+		{
+			if (x < 0 || x >= NUM_ZONES)
+			{
+				return false;
+			}
+			for (int z = zz - 1; z <= zz + 1; ++z)
+			{
+				if (z < 0 || z >= NUM_ZONES)
+				{
+					return false;
+				}
+				Zone zone = zones[x][z];
+				if (!zone.initialized)
+				{
+					return false;
+				}
+				if (zone.sizeO == 0 && zone.sizeA == 0)
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private void loadSubScene(WorldView worldView, Scene scene)
+	{
+		int worldViewId = scene.getWorldViewId();
+		assert worldViewId != -1;
+
+		log.debug("Loading world view {}", worldViewId);
+
+		SceneContext ctx0 = subs[worldViewId];
+		if (ctx0 != null)
+		{
+			log.info("Reload of an already loaded worldview?");
+			return;
+		}
+
+		final SceneContext ctx = new SceneContext(worldView.getSizeX() >> 3, worldView.getSizeY() >> 3);
+		subs[worldViewId] = ctx;
+
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				Zone zone = ctx.zones[x][z];
+				mapUploader.zoneSize(scene, zone, x, z);
+			}
+		}
+
+		// stage in CPU memory; swapSub creates the GL buffers. Sub scenes get their own staging because
+		// a top level load may reuse the arena before this scene is swapped in.
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				ctx.zones[x][z].stage();
+			}
+		}
+
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				Zone zone = ctx.zones[x][z];
+
+				mapUploader.uploadZone(scene, zone, x, z);
+			}
+		}
+	}
+
+	@Override
+	public void despawnWorldView(WorldView worldView)
+	{
+		int worldViewId = worldView.getId();
+		if (worldViewId != WorldView.TOPLEVEL)
+		{
+			log.debug("WorldView despawn: {}", worldViewId);
+			var sub = subs[worldViewId];
+			if (sub == null)
+			{
+				return;
+			}
+
+			sub.free();
+			subs[worldViewId] = null;
+		}
+	}
+
+	@Override
+	public void swapScene(Scene scene)
+	{
+		if (scene.getWorldViewId() != WorldView.TOPLEVEL)
+		{
+			swapSub(scene);
+			return;
+		}
+
+		Stopwatch swSwap = Stopwatch.createStarted();
+		final long sinceLoad = System.nanoTime() - loadSceneDoneNanos;
+
+		final boolean matched = nextScene == scene;
+		final Scene prev = matched ? nextPrevScene : scene;
+		final GameState gameState = nextGameState;
+		nextScene = null;
+		nextPrevScene = null;
+		if (!matched)
+		{
+			log.warn("swapScene without a matching loadScene, nothing is reused");
+		}
+		// Zones are reused across loads only while walking within the same world; every other kind of load
+		// rebuilds everything
+		final boolean mayReuse = matched
+			&& prev.isInstance() == scene.isInstance()
+			&& gameState == GameState.LOGGED_IN;
 
 		// Stop filling the previous scene's deferred zones. Whatever is still pending is not initialized,
-		// so it is culled and freed by the swap like any other unused zone. Its staging is dropped now so
-		// that, should the arena be replaced below, the old one is not kept alive until the swap.
+		// so it is culled and freed below like any other unused zone.
 		deferredUploader.cancel();
-		for (Zone[] column : root.zones)
-		{
-			for (Zone zone : column)
-			{
-				if (zone.pending)
-				{
-					zone.dropStaging();
-				}
-			}
-		}
-
-		if (nextZones != null)
-		{
-			log.debug("Double zone load!");
-			// The previous scene load just gets dropped, this is uncommon and requires a back to back map build packet
-			// while having the first load take more than a full server cycle to complete
-			for (int x = 0; x < NUM_ZONES; ++x)
-			{
-				for (int z = 0; z < NUM_ZONES; ++z)
-				{
-					Zone zone = nextZones[x][z];
-					assert !zone.cull;
-					// anything initialized is a reused zone and so shouldn't be freed; the others were never
-					// committed, so they hold staging and no GL objects and can be dropped on this thread
-					if (!zone.initialized)
-					{
-						assert zone.glVao == 0 && zone.glVaoA == 0;
-						zone.free();
-					}
-				}
-			}
-			nextZones = null;
-			nextRoofChanges = null;
-		}
 
 		SceneContext ctx = root;
-		Scene prev = client.getTopLevelWorldView().getScene();
 
 		regionManager.prepare(scene);
 
@@ -1761,9 +1856,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 		// find zones which overlap and copy them
 		Zone[][] newZones = new Zone[SCENE_ZONES][SCENE_ZONES];
-		final GameState gameState = client.getGameState();
-		if (prev.isInstance() == scene.isInstance()
-			&& gameState == GameState.LOGGED_IN)
+		if (mayReuse)
 		{
 			int[][][] prevTemplates = prev.getInstanceTemplateChunks();
 			int[][][] curTemplates = scene.getInstanceTemplateChunks();
@@ -1871,9 +1964,28 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
-		// Decide which new zones are uploaded before the swap. With deferred upload on, only the zones near
-		// the scene centre (where the client puts the player) are sized, staged and filled here; the rest are
-		// flagged pending and the worker sizes, stages and fills them after the swap, nearest the camera first.
+		// free the old zones that were not reused (cancelled pending zones among them, which hold only
+		// staging) and carry the roof id changes into the reused ones, then install the new table
+		for (int x = 0; x < ctx.sizeX; ++x)
+		{
+			for (int z = 0; z < ctx.sizeZ; ++z)
+			{
+				Zone zone = ctx.zones[x][z];
+				if (zone.cull)
+				{
+					zone.free();
+				}
+				else
+				{
+					zone.updateRoofs(roofChanges);
+				}
+			}
+		}
+		ctx.zones = newZones;
+
+		// Decide which new zones are uploaded now. With deferred upload on, only the zones near the scene
+		// centre (where the client puts the player) are sized, staged, filled and committed here; the rest
+		// are flagged pending and the worker sizes, stages and fills them, nearest the camera first.
 		final boolean defer = config.deferredSceneUpload();
 		final int radius = config.deferredUploadRadius();
 		final int center = NUM_ZONES >> 1;
@@ -1900,7 +2012,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					continue;
 				}
 
-				mapUploader.zoneSize(scene, zone, x, z);
+				clientUploader.zoneSize(scene, zone, x, z);
 				len += zone.sizeO;
 				lena += zone.sizeA;
 				near++;
@@ -1911,9 +2023,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			len, (len * Zone.VERT_SIZE * 3) / 1024,
 			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
 
-		// Stage the near zones in CPU memory. No GL happens on this thread: the GL buffers are created from
-		// the staging at swap, so the load never waits for the client thread. The arena is safe to reuse
-		// because it only ever holds zones that the swap commits.
+		// stage, fill and commit the near zones
 		int stagingInts = (len + lena) * 3 * (Zone.VERT_SIZE / 4);
 		if (stagingArena == null || stagingArena.capacity() < stagingInts)
 		{
@@ -1933,177 +2043,23 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				if (!zone.initialized && !zone.pending)
 				{
 					zone.stage(stagingArena);
-					mapUploader.uploadZone(scene, zone, x, z);
-				}
-			}
-		}
-		log.debug("Scene upload time {} uploaded {} deferred {}", sw, near, deferred);
-
-		nextZones = newZones;
-		nextRoofChanges = roofChanges;
-		loadSceneDoneNanos = System.nanoTime();
-		log.debug("Scene load time {}", swLoad);
-	}
-
-	private static boolean canReuse(Zone[][] zones, int zx, int zz)
-	{
-		// For tile blending, sharelight, and shadows to work correctly, the zones surrounding
-		// the zone must be valid.
-		for (int x = zx - 1; x <= zx + 1; ++x)
-		{
-			if (x < 0 || x >= NUM_ZONES)
-			{
-				return false;
-			}
-			for (int z = zz - 1; z <= zz + 1; ++z)
-			{
-				if (z < 0 || z >= NUM_ZONES)
-				{
-					return false;
-				}
-				Zone zone = zones[x][z];
-				if (!zone.initialized)
-				{
-					return false;
-				}
-				if (zone.sizeO == 0 && zone.sizeA == 0)
-				{
-					return false;
-				}
-			}
-		}
-		return true;
-	}
-
-	private void loadSubScene(WorldView worldView, Scene scene)
-	{
-		int worldViewId = scene.getWorldViewId();
-		assert worldViewId != -1;
-
-		log.debug("Loading world view {}", worldViewId);
-
-		SceneContext ctx0 = subs[worldViewId];
-		if (ctx0 != null)
-		{
-			log.info("Reload of an already loaded worldview?");
-			return;
-		}
-
-		final SceneContext ctx = new SceneContext(worldView.getSizeX() >> 3, worldView.getSizeY() >> 3);
-		subs[worldViewId] = ctx;
-
-		for (int x = 0; x < ctx.sizeX; ++x)
-		{
-			for (int z = 0; z < ctx.sizeZ; ++z)
-			{
-				Zone zone = ctx.zones[x][z];
-				mapUploader.zoneSize(scene, zone, x, z);
-			}
-		}
-
-		// stage in CPU memory; swapSub creates the GL buffers. Sub scenes get their own staging because
-		// a top level load may reuse the arena before this scene is swapped in.
-		for (int x = 0; x < ctx.sizeX; ++x)
-		{
-			for (int z = 0; z < ctx.sizeZ; ++z)
-			{
-				ctx.zones[x][z].stage();
-			}
-		}
-
-		for (int x = 0; x < ctx.sizeX; ++x)
-		{
-			for (int z = 0; z < ctx.sizeZ; ++z)
-			{
-				Zone zone = ctx.zones[x][z];
-
-				mapUploader.uploadZone(scene, zone, x, z);
-			}
-		}
-	}
-
-	@Override
-	public void despawnWorldView(WorldView worldView)
-	{
-		int worldViewId = worldView.getId();
-		if (worldViewId != WorldView.TOPLEVEL)
-		{
-			log.debug("WorldView despawn: {}", worldViewId);
-			var sub = subs[worldViewId];
-			if (sub == null)
-			{
-				return;
-			}
-
-			sub.free();
-			subs[worldViewId] = null;
-		}
-	}
-
-	@Override
-	public void swapScene(Scene scene)
-	{
-		if (scene.getWorldViewId() != WorldView.TOPLEVEL)
-		{
-			swapSub(scene);
-			return;
-		}
-
-		Stopwatch sw = Stopwatch.createStarted();
-		final long sinceLoad = System.nanoTime() - loadSceneDoneNanos;
-		SceneContext ctx = root;
-		for (int x = 0; x < ctx.sizeX; ++x)
-		{
-			for (int z = 0; z < ctx.sizeZ; ++z)
-			{
-				Zone zone = ctx.zones[x][z];
-
-				if (zone.cull)
-				{
-					zone.free();
-				}
-				else
-				{
-					// reused zone
-					zone.updateRoofs(nextRoofChanges);
-				}
-			}
-		}
-		nextRoofChanges = null;
-
-		ctx.zones = nextZones;
-		nextZones = null;
-
-		// setup vaos
-		int pending = 0;
-		for (int x = 0; x < ctx.zones.length; ++x) // NOPMD: ForLoopCanBeForeach
-		{
-			for (int z = 0; z < ctx.zones[0].length; ++z)
-			{
-				Zone zone = ctx.zones[x][z];
-
-				if (zone.pending)
-				{
-					// keeps its staging until the deferred upload has filled it
-					++pending;
-				}
-				else if (!zone.initialized)
-				{
+					clientUploader.uploadZone(scene, zone, x, z);
 					zone.commit();
 					zone.initialized = true;
 				}
 			}
 		}
+		log.debug("Scene upload time {} uploaded {} deferred {}", sw, near, deferred);
 
 		checkGLErrors();
 
-		if (pending > 0)
+		if (deferred > 0)
 		{
 			deferredUploader.start(scene, ctx.zones);
 		}
 		swapNanos = System.nanoTime();
 		awaitingFirstFrame = true;
-		log.debug("Scene swap time {} pending {}, began {} after loadScene returned", sw, pending, millis(sinceLoad));
+		log.debug("Scene swap time {} pending {}, began {} after loadScene returned", swSwap, deferred, millis(sinceLoad));
 	}
 
 	private void swapSub(Scene scene)
