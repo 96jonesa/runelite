@@ -29,6 +29,7 @@ import com.google.common.util.concurrent.Uninterruptibles;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.nio.IntBuffer;
 import java.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Scene;
@@ -40,11 +41,10 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
  * Fills the zones that {@link GpuPlugin#loadScene} left pending, on a worker thread, after the scene
  * has been swapped in.
  * <p>
- * A pending zone already has its staging buffers (CPU memory sliced from the plugin's staging arena
- * during the load), so the worker only writes vertex data into them with its own
- * {@link SceneUploader} and never touches GL. When a zone is filled, the worker posts a completion to
- * the client thread, which creates the zone's GL buffers from the staging and marks it initialized so
- * the next frame draws it.
+ * A pending zone has not been sized: the worker sizes it, slices staging for it from its own arena in
+ * CPU memory, and fills it with its own {@link SceneUploader}, never touching GL. When a zone is
+ * filled, the worker posts a completion to the client thread, which creates the zone's GL buffers from
+ * the staging and marks it initialized so the next frame draws it.
  * <p>
  * The worker reads the live scene, which the client thread may be changing (object updates arrive
  * right after a map load), so a fill can fail. A failed zone is emptied, completed with its
@@ -62,6 +62,10 @@ class DeferredZoneUploader
 	private final SceneUploader uploader;
 	private final DeferredUploadScheduler scheduler = new DeferredUploadScheduler();
 	private final ExecutorService executor;
+
+	// worker thread only. Slices already handed to zones keep an outgrown arena alive until they commit.
+	private IntBuffer arena;
+	private static final int MIN_ARENA_INTS = 4 << 20; // 16 MB
 
 	// zone nearest the camera, in extended zone coordinates; steers which pending zone is filled next
 	private volatile int focusX;
@@ -185,12 +189,21 @@ class DeferredZoneUploader
 	// worker thread
 	private void drain(Scene scene, int gen)
 	{
+		// every slice of the previous drain has been committed or dropped by now: the next load cancels
+		// this worker and drops the staging of whatever it left pending before the swap starts a new drain
+		if (arena != null)
+		{
+			arena.clear();
+		}
+
 		PendingZone p;
 		while ((p = scheduler.pollNearest(gen, focusX, focusZ)) != null)
 		{
 			boolean ok;
 			try
 			{
+				uploader.zoneSize(scene, p.zone, p.zx, p.zz);
+				stage(p.zone);
 				uploader.uploadZone(scene, p.zone, p.zx, p.zz);
 				ok = true;
 			}
@@ -206,6 +219,20 @@ class DeferredZoneUploader
 			final boolean uploaded = ok;
 			clientThread.invoke(() -> finish(done, gen, uploaded));
 		}
+	}
+
+	// worker thread
+	private void stage(Zone zone)
+	{
+		int ints = zone.stagingInts();
+		if (arena == null || arena.remaining() < ints)
+		{
+			int capacity = arena == null ? MIN_ARENA_INTS : arena.capacity() + arena.capacity() / 4;
+			capacity = Math.max(capacity, ints);
+			log.debug("Deferred upload arena {}kb -> {}kb", arena == null ? 0 : arena.capacity() * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
+			arena = GpuIntBuffer.allocateDirect(capacity);
+		}
+		zone.stage(arena);
 	}
 
 	// client thread

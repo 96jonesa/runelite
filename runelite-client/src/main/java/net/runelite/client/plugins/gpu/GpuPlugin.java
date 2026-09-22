@@ -196,6 +196,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	// the same for rebuild, which stages one zone at a time on the client thread
 	private IntBuffer rebuildArena;
 
+	// timing of the client's part of a scene load, for the debug log
+	private volatile long loadSceneDoneNanos;
+	private long swapNanos;
+	private boolean awaitingFirstFrame;
+
 	static class SceneContext
 	{
 		final float[] projection = Mat4.identity();
@@ -1482,6 +1487,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	public void draw(int overlayColor)
 	{
+		if (awaitingFirstFrame)
+		{
+			awaitingFirstFrame = false;
+			log.debug("First frame after swap reached draw {} after the swap", millis(System.nanoTime() - swapNanos));
+		}
+
 		final GameState gameState = client.getGameState();
 		if (gameState == GameState.STARTING)
 		{
@@ -1855,51 +1866,50 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
-		// size the zones which require upload
+		// Decide which new zones are uploaded before the swap. With deferred upload on, only the zones near
+		// the scene centre (where the client puts the player) are sized, staged and filled here; the rest are
+		// flagged pending and the worker sizes, stages and fills them after the swap, nearest the camera first.
+		final boolean defer = config.deferredSceneUpload();
+		final int radius = config.deferredUploadRadius();
+		final int center = NUM_ZONES >> 1;
 		Stopwatch sw = Stopwatch.createStarted();
 		int len = 0, lena = 0;
-		int reused = 0, newzones = 0;
+		int reused = 0, near = 0, deferred = 0;
 		for (int x = 0; x < NUM_ZONES; ++x)
 		{
 			for (int z = 0; z < NUM_ZONES; ++z)
 			{
 				Zone zone = newZones[x][z];
-				if (!zone.initialized)
-				{
-					assert zone.glVao == 0;
-					assert zone.glVaoA == 0;
-					mapUploader.zoneSize(scene, zone, x, z);
-					len += zone.sizeO;
-					lena += zone.sizeA;
-					newzones++;
-				}
-				else
+				if (zone.initialized)
 				{
 					reused++;
+					continue;
 				}
+
+				assert zone.glVao == 0;
+				assert zone.glVaoA == 0;
+				if (defer && !DeferredUploadScheduler.isNear(x, z, center, center, radius))
+				{
+					zone.pending = true;
+					deferred++;
+					continue;
+				}
+
+				mapUploader.zoneSize(scene, zone, x, z);
+				len += zone.sizeO;
+				lena += zone.sizeA;
+				near++;
 			}
 		}
-		log.debug("Scene size time {} reused {} new {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
-			sw, reused, newzones,
+		log.debug("Scene size time {} reused {} near {} deferred {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
+			sw, reused, near, deferred,
 			len, (len * Zone.VERT_SIZE * 3) / 1024,
 			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
 
-		// Stage the zones which require upload in CPU memory. No GL happens on this thread: the GL
-		// buffers are created from the staging at swap (or, for deferred zones, as each is filled), so the
-		// load never waits for the client thread. The arena is safe to reuse because the previous load's
-		// worker was cancelled above and its uncommitted zones are dropped by the swap.
-		int stagingInts = 0;
-		for (int x = 0; x < NUM_ZONES; ++x)
-		{
-			for (int z = 0; z < NUM_ZONES; ++z)
-			{
-				Zone zone = newZones[x][z];
-				if (!zone.initialized)
-				{
-					stagingInts += zone.stagingInts();
-				}
-			}
-		}
+		// Stage the near zones in CPU memory. No GL happens on this thread: the GL buffers are created from
+		// the staging at swap, so the load never waits for the client thread. The arena is safe to reuse
+		// because it only ever holds zones that the swap commits.
+		int stagingInts = (len + lena) * 3 * (Zone.VERT_SIZE / 4);
 		if (stagingArena == null || stagingArena.capacity() < stagingInts)
 		{
 			int oldCapacity = stagingArena == null ? 0 : stagingArena.capacity();
@@ -1908,54 +1918,25 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			stagingArena = GpuIntBuffer.allocateDirect(capacity);
 		}
 		stagingArena.clear();
+
+		sw = Stopwatch.createStarted();
 		for (int x = 0; x < NUM_ZONES; ++x)
 		{
 			for (int z = 0; z < NUM_ZONES; ++z)
 			{
 				Zone zone = newZones[x][z];
-				if (!zone.initialized)
+				if (!zone.initialized && !zone.pending)
 				{
 					zone.stage(stagingArena);
-				}
-			}
-		}
-
-		// upload zones. With deferred upload on, only the zones near the scene centre (where the client
-		// puts the player) are filled here; the rest keep their staging and are filled after the swap.
-		final boolean defer = config.deferredSceneUpload();
-		final int radius = config.deferredUploadRadius();
-		final int center = NUM_ZONES >> 1;
-		int uploaded = 0, deferred = 0;
-		sw = Stopwatch.createStarted();
-		for (int x = 0; x < Constants.EXTENDED_SCENE_SIZE >> 3; ++x)
-		{
-			for (int z = 0; z < Constants.EXTENDED_SCENE_SIZE >> 3; ++z)
-			{
-				Zone zone = newZones[x][z];
-
-				if (zone.initialized)
-				{
-					continue;
-				}
-
-				if (defer
-					&& (zone.sizeO > 0 || zone.sizeA > 0)
-					&& !DeferredUploadScheduler.isNear(x, z, center, center, radius))
-				{
-					zone.pending = true;
-					++deferred;
-				}
-				else
-				{
 					mapUploader.uploadZone(scene, zone, x, z);
-					++uploaded;
 				}
 			}
 		}
-		log.debug("Scene upload time {} uploaded {} deferred {}", sw, uploaded, deferred);
+		log.debug("Scene upload time {} uploaded {} deferred {}", sw, near, deferred);
 
 		nextZones = newZones;
 		nextRoofChanges = roofChanges;
+		loadSceneDoneNanos = System.nanoTime();
 		log.debug("Scene load time {}", swLoad);
 	}
 
@@ -2064,6 +2045,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		Stopwatch sw = Stopwatch.createStarted();
+		final long sinceLoad = System.nanoTime() - loadSceneDoneNanos;
 		SceneContext ctx = root;
 		for (int x = 0; x < ctx.sizeX; ++x)
 		{
@@ -2114,7 +2096,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		{
 			deferredUploader.start(scene, ctx.zones);
 		}
-		log.debug("Scene swap time {} pending {}", sw, pending);
+		swapNanos = System.nanoTime();
+		awaitingFirstFrame = true;
+		log.debug("Scene swap time {} pending {}, began {} after loadScene returned", sw, pending, millis(sinceLoad));
 	}
 
 	private void swapSub(Scene scene)
@@ -2140,6 +2124,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 		log.debug("WorldView ready: {}", scene.getWorldViewId());
+	}
+
+	private static String millis(long nanos)
+	{
+		return String.format("%.2f ms", nanos / 1e6);
 	}
 
 	private int getScaledValue(final double scale, final int value)
