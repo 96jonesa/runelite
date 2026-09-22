@@ -28,6 +28,7 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.Range;
+import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_DEFERRED_UPLOAD_RADIUS;
 import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_DISTANCE;
 import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_FOG_DEPTH;
 import net.runelite.client.plugins.gpu.config.AntiAliasingMode;
@@ -240,6 +241,32 @@ public interface GpuPluginConfig extends Config
 	)
 	@Range(min = 0, max = 15)
 	default int numThreads()
+	{
+		return 3;
+	}
+
+	@ConfigItem(
+		keyName = "deferredSceneUpload",
+		name = "Deferred scene upload",
+		description = "Upload distant scene geometry to the GPU after the scene has loaded instead of before, shortening the loading stall. Distant zones pop in over the following frames.",
+		position = 21
+	)
+	default boolean deferredSceneUpload()
+	{
+		return false;
+	}
+
+	@Range(
+		min = 0,
+		max = MAX_DEFERRED_UPLOAD_RADIUS
+	)
+	@ConfigItem(
+		keyName = "deferredUploadRadius",
+		name = "Deferred upload radius",
+		description = "With deferred scene upload, zones (8x8 tiles) within this many zones of the scene centre are still uploaded before the scene loads. 0 defers everything.",
+		position = 22
+	)
+	default int deferredUploadRadius()
 	{
 		return 3;
 	}

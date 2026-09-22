@@ -104,6 +104,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	static final int SCENE_OFFSET = (Constants.EXTENDED_SCENE_SIZE - Constants.SCENE_SIZE) / 2; // offset for sxy -> msxy
 	private static final int UNIFORM_BUFFER_SIZE = 5 * Float.BYTES;
 	private static final int NUM_ZONES = Constants.EXTENDED_SCENE_SIZE >> 3;
+	// a radius that reaches the scene edge from its centre, which disables deferral
+	static final int MAX_DEFERRED_UPLOAD_RADIUS = NUM_ZONES >> 1;
 	private static final int MAX_WORLDVIEWS = 4096;
 
 	@Inject
@@ -187,6 +189,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private RenderThread[] rts;
 
 	private SceneUploader clientUploader, mapUploader;
+	private DeferredZoneUploader deferredUploader;
 
 	static class SceneContext
 	{
@@ -290,6 +293,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 		clientUploader = new SceneUploader(renderCallbackManager);
 		mapUploader = new SceneUploader(renderCallbackManager);
+		deferredUploader = new DeferredZoneUploader(clientThread, renderCallbackManager);
 		clientThread.invoke(() ->
 		{
 			try
@@ -449,6 +453,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			client.setDrawCallbacks(null);
 			client.setUnlockedFps(false);
 			client.setExpandedMapLoading(0);
+
+			if (deferredUploader != null)
+			{
+				// waits for the zone being filled so root.free() below can't unmap under the worker
+				deferredUploader.shutdown();
+			}
 
 			if (lwjglInitted)
 			{
@@ -865,6 +875,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 			this.cameraYaw = client.getCameraYaw();
 			this.cameraPitch = client.getCameraPitch();
+			deferredUploader.setFocus((ctx.cameraX >> 10) + (SCENE_OFFSET >> 3), (ctx.cameraZ >> 10) + (SCENE_OFFSET >> 3));
 			preSceneDrawToplevel(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw);
 		}
 		else
@@ -1192,7 +1203,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				for (int z = 0; z < ctx.sizeZ; ++z)
 				{
 					Zone zone = ctx.zones[x][z];
-					zone.removeTemp();
+					if (!zone.pending)
+					{
+						zone.removeTemp();
+					}
 				}
 			}
 		}
@@ -1387,6 +1401,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				Zone zone = ctx.zones[x][z];
 				if (!zone.invalidate)
 				{
+					continue;
+				}
+
+				if (zone.pending)
+				{
+					// the deferred upload is still filling it; invalidate stays set so the zone is rebuilt
+					// with the current scene contents once it is ready
 					continue;
 				}
 
@@ -1667,6 +1688,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		Stopwatch swLoad = Stopwatch.createStarted();
+
+		// Stop filling the previous scene's deferred zones. Whatever is still pending is not initialized,
+		// so it is culled and freed by the swap like any other unused zone.
+		deferredUploader.cancel();
+
 		if (nextZones != null)
 		{
 			log.debug("Double zone load!");
@@ -1913,7 +1940,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			throw new RuntimeException(e);
 		}
 
-		// upload zones
+		// upload zones. With deferred upload on, only the zones near the scene centre (where the client
+		// puts the player) are filled here; the rest stay mapped and are filled after the swap.
+		final boolean defer = config.deferredSceneUpload();
+		final int radius = config.deferredUploadRadius();
+		final int center = NUM_ZONES >> 1;
+		int uploaded = 0, deferred = 0;
 		sw = Stopwatch.createStarted();
 		for (int x = 0; x < Constants.EXTENDED_SCENE_SIZE >> 3; ++x)
 		{
@@ -1921,16 +1953,30 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			{
 				Zone zone = newZones[x][z];
 
-				if (!zone.initialized)
+				if (zone.initialized)
+				{
+					continue;
+				}
+
+				if (defer
+					&& (zone.sizeO > 0 || zone.sizeA > 0)
+					&& !DeferredUploadScheduler.isNear(x, z, center, center, radius))
+				{
+					zone.pending = true;
+					++deferred;
+				}
+				else
 				{
 					mapUploader.uploadZone(scene, zone, x, z);
+					++uploaded;
 				}
 			}
 		}
-		log.debug("Scene upload time {}", sw);
+		log.debug("Scene upload time {} uploaded {} deferred {}", sw, uploaded, deferred);
 
 		nextZones = newZones;
 		nextRoofChanges = roofChanges;
+		log.debug("Scene load time {}", swLoad);
 	}
 
 	private static boolean canReuse(Zone[][] zones, int zx, int zz)
@@ -2069,6 +2115,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		Stopwatch sw = Stopwatch.createStarted();
 		SceneContext ctx = root;
 		for (int x = 0; x < ctx.sizeX; ++x)
 		{
@@ -2093,13 +2140,19 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		nextZones = null;
 
 		// setup vaos
+		int pending = 0;
 		for (int x = 0; x < ctx.zones.length; ++x) // NOPMD: ForLoopCanBeForeach
 		{
 			for (int z = 0; z < ctx.zones[0].length; ++z)
 			{
 				Zone zone = ctx.zones[x][z];
 
-				if (!zone.initialized)
+				if (zone.pending)
+				{
+					// stays mapped until the deferred upload has filled it
+					++pending;
+				}
+				else if (!zone.initialized)
 				{
 					zone.unmap();
 					zone.initialized = true;
@@ -2108,6 +2161,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		checkGLErrors();
+
+		if (pending > 0)
+		{
+			deferredUploader.start(scene, ctx.zones);
+		}
+		log.debug("Scene swap time {} pending {}", sw, pending);
 	}
 
 	private void swapSub(Scene scene)

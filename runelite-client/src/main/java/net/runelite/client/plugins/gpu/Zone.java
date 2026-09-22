@@ -68,6 +68,7 @@ class Zone
 	boolean cull; // whether the zone is queued for deletion
 	boolean dirty; // whether the zone has temporary modifications
 	boolean invalidate; // whether the zone needs rebuilding
+	boolean pending; // whether the zone is mapped but its upload was deferred past the scene swap
 
 	int[] levelOffsets = new int[4]; // buffer pos in ints for the end of the level
 
@@ -125,6 +126,27 @@ class Zone
 
 		// don't add permanent alphamodels to the cache as permanent alphamodels are always allocated
 		// to avoid having to synchronize the cache
+		alphaModels.clear();
+	}
+
+	/**
+	 * Empty a zone whose upload was abandoned part way, so that once unmapped it draws nothing. The
+	 * buffers stay mapped; unmap() then records a length of zero.
+	 */
+	void discardUpload()
+	{
+		if (vboO != null)
+		{
+			vboO.vb.position(0);
+		}
+		if (vboA != null)
+		{
+			vboA.vb.position(0);
+		}
+		rids = new int[4][0];
+		roofStart = new int[4][0];
+		roofEnd = new int[4][0];
+		Arrays.fill(levelOffsets, 0);
 		alphaModels.clear();
 	}
 
@@ -430,6 +452,13 @@ class Zone
 
 	synchronized void addTempAlphaModel(int vao, int startpos, int endpos, int level, int x, int y, int z)
 	{
+		if (pending)
+		{
+			// the deferred upload is appending static alpha models to this zone from its worker thread, and
+			// renderAlpha skips the zone until it is initialized, so the temp model would not be drawn anyway
+			return;
+		}
+
 		AlphaModel m;
 		synchronized (modelCache)
 		{
@@ -742,6 +771,13 @@ class Zone
 				Zone z = zones[closestZoneX + offset][closestZoneZ + offset];
 				assert z != null;
 				assert z != this;
+
+				if (z.pending)
+				{
+					// the deferred upload is still appending to that zone's alpha models; keep drawing the
+					// model from this zone until the other one is ready
+					continue;
+				}
 
 				AlphaModel m2 = modelCache.poll();
 				if (m2 == null)
