@@ -247,8 +247,8 @@ public interface GpuPluginConfig extends Config
 
 	@ConfigItem(
 		keyName = "deferredSceneUpload",
-		name = "Deferred scene upload",
-		description = "Upload distant scene geometry to the GPU after the scene has loaded instead of before, shortening the loading stall. Distant zones pop in over the following frames.",
+		name = "Upload scenery after loading",
+		description = "Let the loading screen end before the plugin uploads the scene, then fill it in over the next few frames, nearest first. Takes the plugin's work out of the loading screen.",
 		position = 21
 	)
 	default boolean deferredSceneUpload()
@@ -262,8 +262,8 @@ public interface GpuPluginConfig extends Config
 	)
 	@ConfigItem(
 		keyName = "deferredUploadRadius",
-		name = "Deferred upload radius",
-		description = "With deferred scene upload, zones (8x8 tiles) within this many zones of the scene centre are still uploaded before the scene loads. 0 defers everything.",
+		name = "Upload radius before the first frame",
+		description = "Zones (8x8 tiles) around the one you stand in that are uploaded before the first frame is drawn, as a radius: 0 is just your own zone, 1 is a 3x3 block, 2 is 5x5. Each zone adds about half a millisecond of loading time.",
 		position = 22
 	)
 	default int deferredUploadRadius()
