@@ -243,4 +243,30 @@ public interface GpuPluginConfig extends Config
 	{
 		return 3;
 	}
+
+	@ConfigItem(
+		keyName = "deferredSceneUpload",
+		name = "Upload scenery after loading",
+		description = "Finish loading before the plugin uploads scenery; distant scenery then pops in over the next few frames.",
+		position = 21
+	)
+	default boolean deferredSceneUpload()
+	{
+		return false;
+	}
+
+	@Range(
+		min = 0,
+		max = 3
+	)
+	@ConfigItem(
+		keyName = "deferredUploadRadius",
+		name = "Upload radius before the first frame",
+		description = "With scenery uploaded after loading: the zones (8x8 tiles) around the one you stand in that are still uploaded before the first frame is drawn, as a radius. 0 is just your own zone, 1 a 3x3 block, 2 a 5x5 block. Larger values add to the loading time.",
+		position = 22
+	)
+	default int deferredUploadRadius()
+	{
+		return 1;
+	}
 }

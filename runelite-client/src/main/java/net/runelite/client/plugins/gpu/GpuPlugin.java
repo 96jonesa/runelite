@@ -188,6 +188,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private RenderThread[] rts;
 
 	private SceneUploader clientUploader, mapUploader;
+	private DeferredZoneUploader deferredUploader;
 	// CPU memory zone vertex data is written into before it is committed to GL; see arena()
 	private IntBuffer stagingArena; // client thread
 	private IntBuffer loaderArena; // map loader thread
@@ -259,7 +260,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	// handed from loadScene (map loader thread) to swapScene (client thread) by the client's own load
 	// handoff, the same way the built scene itself is. nextScene is written last and read first.
 	private volatile Scene nextScene;
-	private volatile Zone[][] nextZones;
+	private volatile Scene nextPrevScene;
+	private volatile GameState nextGameState;
+	private volatile Zone[][] nextZones; // prepared on the loader thread; only with deferral off
 	private volatile Map<Integer, Integer> nextRoofChanges;
 
 	// Uniforms
@@ -302,6 +305,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 		clientUploader = new SceneUploader(renderCallbackManager);
 		mapUploader = new SceneUploader(renderCallbackManager);
+		deferredUploader = new DeferredZoneUploader(renderCallbackManager);
 		clientThread.invoke(() ->
 		{
 			try
@@ -462,6 +466,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			client.setUnlockedFps(false);
 			client.setExpandedMapLoading(0);
 
+			if (deferredUploader != null)
+			{
+				// waits for the zone being filled so nothing writes staging after root.free() below
+				deferredUploader.shutdown();
+			}
 			stagingArena = null;
 			loaderArena = null;
 
@@ -880,6 +889,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 			this.cameraYaw = client.getCameraYaw();
 			this.cameraPitch = client.getCameraPitch();
+			// zones the worker finished during the previous frame are drawn in this one
+			deferredUploader.commitFinished();
+			deferredUploader.setFocus((ctx.cameraX >> 10) + (SCENE_OFFSET >> 3), (ctx.cameraZ >> 10) + (SCENE_OFFSET >> 3));
 			preSceneDrawToplevel(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw);
 		}
 		else
@@ -1207,7 +1219,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				for (int z = 0; z < ctx.sizeZ; ++z)
 				{
 					Zone zone = ctx.zones[x][z];
-					zone.removeTemp();
+					if (!zone.pending)
+					{
+						zone.removeTemp();
+					}
 				}
 			}
 		}
@@ -1379,6 +1394,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		// fallback for when no frames are drawn; also lets a zone finished and invalidated in the same
+		// tick be rebuilt below
+		deferredUploader.commitFinished();
 		rebuild(wv);
 		for (WorldEntity we : wv.worldEntities())
 		{
@@ -1402,6 +1420,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				Zone zone = ctx.zones[x][z];
 				if (!zone.invalidate)
 				{
+					continue;
+				}
+
+				if (zone.pending)
+				{
+					// the deferred upload is still filling it; invalidate stays set so the zone is rebuilt
+					// with the current scene contents once it is ready
 					continue;
 				}
 
@@ -1641,8 +1666,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			// this is to avoid scene fbo blit when going from <loading to >=loading,
 			// but keep it when doing >loading to loading
 			sceneFboValid = false;
-			// a load in flight is dropped by the client; don't keep its scene alive
+			// a load in flight is dropped by the client; don't keep its scenes alive
 			nextScene = null;
+			nextPrevScene = null;
+			nextGameState = null;
 			nextZones = null;
 			nextRoofChanges = null;
 		}
@@ -1670,14 +1697,31 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		final Scene prev = client.getTopLevelWorldView().getScene();
 		final GameState gameState = client.getGameState();
 
-		// The whole scene is prepared on the loader thread, in CPU staging and without any GL, so this never
-		// waits for the client thread; the swap only commits it.
+		if (config.deferredSceneUpload())
+		{
+			// The client calls this on its map loader thread and only notices that the build has finished
+			// once per game cycle, so anything done here is rounded up to that cycle. Record what the swap
+			// needs and return: the plugin's whole share of the load happens in swapScene, on the client
+			// thread, after the client has noticed.
+			nextZones = null;
+			nextRoofChanges = null;
+			nextPrevScene = prev;
+			nextGameState = gameState;
+			nextScene = scene;
+			return;
+		}
+
+		// Deferral off: the whole scene is prepared on the loader thread, in CPU staging and without any GL,
+		// and the swap only commits it.
 		Stopwatch swLoad = Stopwatch.createStarted();
+		deferredUploader.abandon();
 		Map<Integer, Integer> roofChanges = new HashMap<>();
 		Zone[][] newZones = planScene(scene, prev, mayReuse(prev, scene, gameState), roofChanges);
 		uploadZones(scene, newZones, false);
 		nextRoofChanges = roofChanges;
 		nextZones = newZones;
+		nextPrevScene = prev;
+		nextGameState = gameState;
 		nextScene = scene;
 		log.debug("Scene load time {}", swLoad);
 	}
@@ -1828,16 +1872,23 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	}
 
 	/**
-	 * Size, stage and fill every new zone of the new table. On the loader thread that is with the loader's
-	 * uploader and arena, committed later by the swap; on the client thread (a swap without a matching
-	 * load) with the client's, committed here.
+	 * Size, stage and fill the zones of the new table that are uploaded before the scene is drawn. On the
+	 * loader thread (deferral off) that is every new zone, filled with the loader's uploader and arena and
+	 * committed later by the swap. On the client thread it is the block around the scene centre when
+	 * deferral is on, or every zone otherwise, filled with the client's uploader and arena and committed
+	 * here; the rest are flagged pending for the worker.
+	 *
+	 * @return the number of zones left pending
 	 */
-	private void uploadZones(Scene scene, Zone[][] newZones, boolean onClientThread)
+	private int uploadZones(Scene scene, Zone[][] newZones, boolean onClientThread)
 	{
 		final SceneUploader uploader = onClientThread ? clientUploader : mapUploader;
+		final boolean defer = onClientThread && config.deferredSceneUpload();
+		final int radius = config.deferredUploadRadius();
+		final int center = NUM_ZONES >> 1;
 		Stopwatch sw = Stopwatch.createStarted();
 		int len = 0, lena = 0;
-		int reused = 0, near = 0;
+		int reused = 0, near = 0, deferred = 0;
 		for (int x = 0; x < NUM_ZONES; ++x)
 		{
 			for (int z = 0; z < NUM_ZONES; ++z)
@@ -1851,14 +1902,21 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				assert zone.glVao == 0;
 				assert zone.glVaoA == 0;
+				if (defer && !DeferredUploadScheduler.isNear(x, z, center, center, radius))
+				{
+					zone.pending = true;
+					deferred++;
+					continue;
+				}
+
 				uploader.zoneSize(scene, zone, x, z);
 				len += zone.sizeO;
 				lena += zone.sizeA;
 				near++;
 			}
 		}
-		log.debug("Scene size time {} reused {} new {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
-			sw, reused, near,
+		log.debug("Scene size time {} reused {} new {} deferred {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
+			sw, reused, near, deferred,
 			len, (len * Zone.VERT_SIZE * 3) / 1024,
 			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
 
@@ -1869,7 +1927,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			for (int z = 0; z < NUM_ZONES; ++z)
 			{
 				Zone zone = newZones[x][z];
-				if (!zone.initialized)
+				if (!zone.initialized && !zone.pending)
 				{
 					zone.stage(arena);
 					uploader.uploadZone(scene, zone, x, z);
@@ -1881,7 +1939,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 		}
-		log.debug("Scene upload time {}", sw);
+		log.debug("Scene upload time {} uploaded {} deferred {}", sw, near, deferred);
+		return deferred;
 	}
 
 	/**
@@ -2018,18 +2077,28 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		Stopwatch swSwap = Stopwatch.createStarted();
 
 		final boolean matched = nextScene == scene;
+		final Scene prev = matched ? nextPrevScene : scene;
+		final GameState gameState = nextGameState;
 		final Zone[][] prepared = matched ? nextZones : null;
 		final Map<Integer, Integer> roofChanges = prepared != null ? nextRoofChanges : new HashMap<>();
 		nextScene = null;
+		nextPrevScene = null;
+		nextGameState = null;
 		nextZones = null;
 		nextRoofChanges = null;
+		if (!matched)
+		{
+			log.warn("swapScene without a matching loadScene, nothing is reused");
+		}
 
 		SceneContext ctx = root;
 		final Zone[][] newZones;
+		final int pending;
 		if (prepared != null)
 		{
-			// the loader thread sized, staged and filled every zone; commit them
+			// deferral off: the loader thread sized, staged and filled every zone; commit them
 			newZones = prepared;
+			pending = 0;
 			for (int x = 0; x < NUM_ZONES; ++x)
 			{
 				for (int z = 0; z < NUM_ZONES; ++z)
@@ -2045,14 +2114,21 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 		else
 		{
-			// no matching loadScene (the plugin started mid load): build everything here, reusing nothing
-			log.warn("swapScene without a matching loadScene, nothing is reused");
-			newZones = planScene(scene, scene, false, roofChanges);
-			uploadZones(scene, newZones, true);
+			// deferral on: the plugin's whole share of the load happens here, after the client has noticed
+			// the build. Zones the worker has already filled are committed first so the new scene can reuse
+			// them; whatever is still pending is dropped below without waiting for the worker, since such
+			// zones hold no GL objects.
+			deferredUploader.commitFinished();
+			deferredUploader.abandon();
+			newZones = planScene(scene, prev, matched && mayReuse(prev, scene, gameState), roofChanges);
+			// filled and committed before the table is installed, so a failure here leaves the old scene intact.
+			// An unmatched swap lands here with deferral off too; then nothing is deferred.
+			pending = uploadZones(scene, newZones, true);
 		}
 
 		// Free the old zones that were not reused with one batched delete, carry the roof id changes into
-		// the reused ones, then install the new table.
+		// the reused ones, then install the new table. Zones still pending hold no GL objects and may
+		// still be written by the worker, so they are simply dropped.
 		deleteBuffers.clear();
 		deleteVertexArrays.clear();
 		for (int x = 0; x < ctx.sizeX; ++x)
@@ -2060,13 +2136,17 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			for (int z = 0; z < ctx.sizeZ; ++z)
 			{
 				Zone zone = ctx.zones[x][z];
-				if (zone.cull)
+				if (!zone.cull)
+				{
+					zone.updateRoofs(roofChanges);
+				}
+				else if (!zone.pending)
 				{
 					zone.freeInto(deleteBuffers, deleteVertexArrays);
 				}
 				else
 				{
-					zone.updateRoofs(roofChanges);
+					assert zone.glVao == 0 && zone.glVaoA == 0;
 				}
 			}
 		}
@@ -2083,7 +2163,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		ctx.zones = newZones;
 
 		checkGLErrors();
-		log.debug("Scene swap time {}", swSwap);
+
+		if (pending > 0)
+		{
+			deferredUploader.start(scene, ctx.zones);
+		}
+		log.debug("Scene swap time {} pending {}", swSwap, pending);
 	}
 
 	private void swapSub(Scene scene)

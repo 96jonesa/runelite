@@ -34,8 +34,8 @@ import org.junit.experimental.runners.Enclosed;
 import org.junit.runner.RunWith;
 
 /**
- * The staging side of Zone, which has no GL in it, and the commit() path that makes no GL call: an
- * empty zone. A commit with data creates GL objects and is covered in game.
+ * The staging side of Zone, which has no GL in it, and the two commit() paths that make no GL call:
+ * an empty zone and a discarded one. A commit with data creates GL objects and is covered in game.
  */
 @RunWith(Enclosed.class)
 public class ZoneTest
@@ -127,6 +127,42 @@ public class ZoneTest
 		}
 	}
 
+	public static class DiscardUpload
+	{
+		@Test
+		public void emptiesAPartlyWrittenZone()
+		{
+			Zone z = zoneOf(2, 1);
+			z.stage();
+			z.stageO.put(1).put(2).put(3);
+			z.stageA.put(4);
+			z.rids = new int[][]{{7}, {}, {}, {}};
+			z.roofStart = new int[][]{{0}, {}, {}, {}};
+			z.roofEnd = new int[][]{{3}, {}, {}, {}};
+			z.levelOffsets[0] = 3;
+			z.alphaModels.add(new Zone.AlphaModel());
+
+			z.discardUpload();
+
+			assertEquals(0, z.stageO.position());
+			assertEquals(0, z.stageA.position());
+			assertEquals(0, z.rids[0].length);
+			assertEquals(0, z.roofStart[0].length);
+			assertEquals(0, z.roofEnd[0].length);
+			assertEquals(0, z.levelOffsets[0]);
+			assertTrue(z.alphaModels.isEmpty());
+		}
+
+		@Test
+		public void toleratesAnUnstagedZone()
+		{
+			Zone z = zoneOf(0, 0);
+			z.discardUpload();
+			assertNull(z.stageO);
+			assertNull(z.stageA);
+		}
+	}
+
 	public static class Commit
 	{
 		@Test
@@ -145,6 +181,26 @@ public class ZoneTest
 			assertEquals(0, z.bufLenA);
 		}
 
+		@Test
+		public void aDiscardedZoneCommitsToNothing()
+		{
+			// the guarantee a failed deferred fill relies on: it is drawn as nothing until rebuilt
+			Zone z = zoneOf(2, 1);
+			z.stage();
+			z.stageO.put(1).put(2).put(3);
+			z.stageA.put(4);
+			z.discardUpload();
+
+			z.commit();
+
+			assertEquals(0, z.glVao);
+			assertEquals(0, z.glVaoA);
+			assertNull(z.vboO);
+			assertNull(z.vboA);
+			assertEquals(0, z.bufLen);
+			assertNull(z.stageO);
+			assertNull(z.stageA);
+		}
 	}
 
 	public static class DropStaging
