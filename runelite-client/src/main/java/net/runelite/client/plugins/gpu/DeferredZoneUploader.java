@@ -39,8 +39,8 @@ import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
 
 /**
- * Fills the zones that {@link GpuPlugin#loadScene} left pending, on a worker thread, after the scene
- * has been swapped in.
+ * Fills the zones that the scene swap left pending, on a worker thread, after the scene has been
+ * swapped in.
  * <p>
  * A pending zone has not been sized: the worker sizes it, slices staging for it from its own arena in
  * CPU memory, and fills it with its own {@link SceneUploader}, never touching GL. When a zone is
@@ -53,13 +53,13 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
  * invalidate flag set, and rebuilt from the current scene contents by the plugin's normal rebuild
  * path on the client thread.
  * <p>
- * The next scene stops this one's worker first. The swap (client thread) calls {@link #abandon()}: it
- * drops the queue and lets the zone being filled finish on its own, since that zone leaves the live
- * table without ever holding GL objects. A load with deferral off (loader thread) and shutdown call
- * {@link #cancel()}, which also waits for the zone being filled before the caller frees zones. Either
- * way a completion still queued afterwards carries a stale generation and is ignored; the generation
- * check and the commit in {@link #finish} share the monitor the generation is bumped under because
- * cancel() may run on the loader thread.
+ * The next scene stops this one's worker first with {@link #abandon()}, from the swap on the client
+ * thread or from loadScene on the loader thread when deferral is off: it drops the queue and lets the
+ * zone being filled finish on its own, since that zone leaves the live table without ever holding GL
+ * objects. Only shutdown uses {@link #cancel()}, which also waits for the zone being filled, because
+ * shutdown then frees every zone of the live table, pending ones included. A completion still queued
+ * after either carries a stale generation and is ignored; the generation check and the commit in
+ * {@link #finish} are one step under the monitor the generation is bumped under.
  */
 @Slf4j
 class DeferredZoneUploader
@@ -176,8 +176,9 @@ class DeferredZoneUploader
 
 	/**
 	 * Drop every queued zone and wait for the zone currently being filled, if any, so that the caller
-	 * may reuse the staging afterwards. Completions the worker already posted are ignored by the client
-	 * thread because they carry the old generation. Must not be called from the worker thread.
+	 * may free every zone afterwards, including the one the worker was writing. Completions the worker
+	 * already posted are ignored because they carry the old generation. Must not be called from the
+	 * worker thread.
 	 */
 	void cancel()
 	{
@@ -196,7 +197,7 @@ class DeferredZoneUploader
 		{
 			try
 			{
-				// an interrupted wait must not return early: the caller reuses the staging next
+				// an interrupted wait must not return early: the caller frees the zones next
 				Uninterruptibles.getUninterruptibly(f);
 			}
 			catch (ExecutionException e)
@@ -214,9 +215,9 @@ class DeferredZoneUploader
 
 	/**
 	 * Like {@link #cancel()} but without waiting for the zone being filled. For callers that will not touch
-	 * the pending zones afterwards (the swap drops them unfreed, since they hold no GL objects); the next
-	 * drain still runs after this one on the single worker thread, so the worker's arena is not reused
-	 * under it.
+	 * the pending zones afterwards (the next swap drops them unfreed, since they hold no GL objects); the
+	 * next drain still runs after this one on the single worker thread, so the worker's arena is not
+	 * reused under it.
 	 */
 	void abandon()
 	{
@@ -324,8 +325,8 @@ class DeferredZoneUploader
 	private void finish(PendingZone p, int gen, boolean uploaded)
 	{
 		Zone zone = p.zone;
-		// the generation check and the commit are one step under the lock cancel() bumps the generation
-		// under, so a cancel() from the loader thread can't interleave with a commit
+		// the generation check and the commit are one step under the lock the generation is bumped under,
+		// so a bump from another thread cannot land between them
 		synchronized (this)
 		{
 			if (!scheduler.isCurrent(gen) || !zone.pending)

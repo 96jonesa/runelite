@@ -105,8 +105,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	static final int SCENE_OFFSET = (Constants.EXTENDED_SCENE_SIZE - Constants.SCENE_SIZE) / 2; // offset for sxy -> msxy
 	private static final int UNIFORM_BUFFER_SIZE = 5 * Float.BYTES;
 	private static final int NUM_ZONES = Constants.EXTENDED_SCENE_SIZE >> 3;
-	// a radius that reaches the scene edge from its centre, which disables deferral
-	static final int MAX_DEFERRED_UPLOAD_RADIUS = NUM_ZONES >> 1;
 	private static final int MAX_WORLDVIEWS = 4096;
 
 	@Inject
@@ -1715,11 +1713,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		// Deferral off: the whole scene is prepared here as it always was, but in CPU staging and without
 		// any GL, so the swap only has to commit it.
 		Stopwatch swLoad = Stopwatch.createStarted();
-		deferredUploader.cancel();
+		deferredUploader.abandon();
 		Map<Integer, Integer> roofChanges = new HashMap<>();
 		Zone[][] newZones = planScene(scene, prev,
 			prev.isInstance() == scene.isInstance() && gameState == GameState.LOGGED_IN, roofChanges);
-		uploadNear(scene, newZones, false, mapUploader, false);
+		uploadZones(scene, newZones, false);
 		nextRoofChanges = roofChanges;
 		nextZones = newZones;
 		nextPrevScene = prev;
@@ -1866,14 +1864,18 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	}
 
 	/**
-	 * Size, stage and fill the zones of the new table that are uploaded before the scene is drawn: all of
-	 * them with deferral off, the block around the scene centre with it on; the rest are flagged pending
-	 * for the worker. On the client thread (commit set) each filled zone is also committed to GL.
+	 * Size, stage and fill the zones of the new table that are uploaded before the scene is drawn. On the
+	 * loader thread (deferral off) that is every new zone, filled with the loader's uploader and arena and
+	 * committed later by the swap. On the client thread it is the block around the scene centre when
+	 * deferral is on, or every zone otherwise, filled with the client's uploader and arena and committed
+	 * here; the rest are flagged pending for the worker.
 	 *
 	 * @return the number of zones left pending
 	 */
-	private int uploadNear(Scene scene, Zone[][] newZones, boolean defer, SceneUploader uploader, boolean commit)
+	private int uploadZones(Scene scene, Zone[][] newZones, boolean onClientThread)
 	{
+		final SceneUploader uploader = onClientThread ? clientUploader : mapUploader;
+		final boolean defer = onClientThread && config.deferredSceneUpload();
 		final int radius = config.deferredUploadRadius();
 		final int center = NUM_ZONES >> 1;
 		Stopwatch sw = Stopwatch.createStarted();
@@ -1910,7 +1912,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			len, (len * Zone.VERT_SIZE * 3) / 1024,
 			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
 
-		IntBuffer arena = arena(commit, (len + lena) * 3 * (Zone.VERT_SIZE / 4));
+		IntBuffer arena = arena(onClientThread, (len + lena) * 3 * (Zone.VERT_SIZE / 4));
 		sw = Stopwatch.createStarted();
 		for (int x = 0; x < NUM_ZONES; ++x)
 		{
@@ -1921,7 +1923,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				{
 					zone.stage(arena);
 					uploader.uploadZone(scene, zone, x, z);
-					if (commit)
+					if (onClientThread)
 					{
 						zone.commit();
 						zone.initialized = true;
@@ -2116,7 +2118,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			newZones = planScene(scene, prev, mayReuse, roofChanges);
 			// filled and committed before the table is installed, so a failure here leaves the old scene intact.
 			// An unmatched swap lands here with deferral off too; then nothing is deferred.
-			pending = uploadNear(scene, newZones, config.deferredSceneUpload(), clientUploader, true);
+			pending = uploadZones(scene, newZones, true);
 		}
 
 		// Free the old zones that were not reused with one batched delete, carry the roof id changes into

@@ -28,7 +28,6 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.Range;
-import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_DEFERRED_UPLOAD_RADIUS;
 import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_DISTANCE;
 import static net.runelite.client.plugins.gpu.GpuPlugin.MAX_FOG_DEPTH;
 import net.runelite.client.plugins.gpu.config.AntiAliasingMode;
@@ -258,12 +257,12 @@ public interface GpuPluginConfig extends Config
 
 	@Range(
 		min = 0,
-		max = MAX_DEFERRED_UPLOAD_RADIUS
+		max = 3
 	)
 	@ConfigItem(
 		keyName = "deferredUploadRadius",
 		name = "Upload radius before the first frame",
-		description = "Zones (8x8 tiles) around the one you stand in that are uploaded before the first frame is drawn, as a radius: 0 is just your own zone, 1 is a 3x3 block, 2 is 5x5. Each zone adds about half a millisecond of loading time.",
+		description = "With scenery uploaded after loading: the zones (8x8 tiles) around the one you stand in that are still uploaded before the first frame is drawn, as a radius. 0 is just your own zone, 1 a 3x3 block, 2 a 5x5 block. Larger values add to the loading time.",
 		position = 22
 	)
 	default int deferredUploadRadius()
