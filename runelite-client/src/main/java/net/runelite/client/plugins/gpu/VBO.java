@@ -35,7 +35,6 @@ class VBO
 	int bufId;
 	private ByteBuffer buffer;
 	IntBuffer vb;
-	int len;
 	boolean mapped;
 
 	VBO(int size)
@@ -50,6 +49,19 @@ class VBO
 
 		glBindBuffer(GL_ARRAY_BUFFER, bufId);
 		glBufferData(GL_ARRAY_BUFFER, size, usage);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+	}
+
+	/**
+	 * Create the buffer and fill it with data's contents from its position to its limit.
+	 */
+	void init(int usage, IntBuffer data)
+	{
+		this.usage = usage;
+		bufId = glGenBuffers();
+
+		glBindBuffer(GL_ARRAY_BUFFER, bufId);
+		glBufferData(GL_ARRAY_BUFFER, data, usage);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 	}
 
@@ -84,7 +96,7 @@ class VBO
 	void unmap()
 	{
 		assert mapped;
-		len = vb.position();
+		final int len = vb.position();
 		vb = null;
 
 		glBindBuffer(GL_ARRAY_BUFFER, bufId);

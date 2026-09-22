@@ -63,6 +63,8 @@ class Zone
 
 	int sizeO, sizeA;
 	VBO vboO, vboA;
+	// vertex data written by the uploader, in CPU memory, until commit() turns it into the GL buffers
+	IntBuffer stageO, stageA;
 
 	boolean initialized; // whether the zone vao and vbos are ready
 	boolean cull; // whether the zone is queued for deletion
@@ -77,28 +79,146 @@ class Zone
 
 	final List<AlphaModel> alphaModels = new ArrayList<>(0);
 
-	void init(VBO o, VBO a)
+	private static final int INTS_PER_FACE = 3 * (VERT_SIZE / 4);
+
+	/**
+	 * Give the zone its own staging buffers, sized from zoneSize(). Any thread, no GL.
+	 */
+	void stage()
+	{
+		stageO = sizeO > 0 ? GpuIntBuffer.allocateDirect(sizeO * INTS_PER_FACE) : null;
+		stageA = sizeA > 0 ? GpuIntBuffer.allocateDirect(sizeA * INTS_PER_FACE) : null;
+	}
+
+	/**
+	 * Number of ints of staging the zone takes from an arena in {@link #stage(IntBuffer)}.
+	 */
+	int stagingInts()
+	{
+		return (sizeO + sizeA) * INTS_PER_FACE;
+	}
+
+	/**
+	 * Give the zone staging buffers sliced from the arena at its position, which is advanced past them.
+	 */
+	void stage(IntBuffer arena)
+	{
+		stageO = slice(arena, sizeO * INTS_PER_FACE);
+		stageA = slice(arena, sizeA * INTS_PER_FACE);
+	}
+
+	private static IntBuffer slice(IntBuffer arena, int ints)
+	{
+		if (ints == 0)
+		{
+			return null;
+		}
+		int start = arena.position();
+		arena.limit(start + ints);
+		IntBuffer s = arena.slice();
+		arena.limit(arena.capacity());
+		arena.position(start + ints);
+		return s;
+	}
+
+	/**
+	 * Create the GL buffers and vertex arrays from the staging buffers, then drop the staging. Client
+	 * thread. Staging nothing was written to yields no GL buffer, so such a zone draws nothing.
+	 */
+	void commit()
 	{
 		assert glVao == 0;
 		assert glVaoA == 0;
 
-		if (o != null)
+		if (stageO != null)
 		{
-			vboO = o;
-			glVao = glGenVertexArrays();
-			setupVao(glVao, o.bufId);
+			stageO.flip();
+			bufLen = stageO.remaining() / (VERT_SIZE / 4);
+			if (stageO.hasRemaining())
+			{
+				vboO = new VBO(stageO.remaining() * Integer.BYTES);
+				vboO.init(GL_STATIC_DRAW, stageO);
+				glVao = glGenVertexArrays();
+				setupVao(glVao, vboO.bufId);
+			}
+			stageO = null;
 		}
 
-		if (a != null)
+		if (stageA != null)
 		{
-			vboA = a;
-			glVaoA = glGenVertexArrays();
-			setupVao(glVaoA, a.bufId);
+			stageA.flip();
+			bufLenA = stageA.remaining() / (VERT_SIZE / 4);
+			if (stageA.hasRemaining())
+			{
+				vboA = new VBO(stageA.remaining() * Integer.BYTES);
+				vboA.init(GL_STATIC_DRAW, stageA);
+				glVaoA = glGenVertexArrays();
+				setupVao(glVaoA, vboA.bufId);
+			}
+			stageA = null;
 		}
+
+		// the static alpha models were recorded by the uploader before the vertex array existed. A sub scene's
+		// zones are live before their swap, so one may also hold a temp model, which keeps its own vao.
+		for (AlphaModel m : alphaModels)
+		{
+			if (!m.isTemp() && (m.flags & AlphaModel.TEMP) == 0)
+			{
+				m.vao = glVaoA;
+			}
+		}
+	}
+
+	/**
+	 * Forget the staging buffers without committing them.
+	 */
+	void dropStaging()
+	{
+		stageO = null;
+		stageA = null;
+	}
+
+	/**
+	 * Like free(), but the GL objects are appended to the given buffers for one batched delete instead of
+	 * being deleted here, so freeing a whole scene costs two GL calls rather than four per zone. No GL.
+	 */
+	void freeInto(IntBuffer buffers, IntBuffer vertexArrays)
+	{
+		dropStaging();
+
+		if (vboO != null)
+		{
+			assert !vboO.mapped;
+			buffers.put(vboO.bufId);
+			vboO = null;
+		}
+
+		if (vboA != null)
+		{
+			assert !vboA.mapped;
+			buffers.put(vboA.bufId);
+			vboA = null;
+		}
+
+		if (glVao != 0)
+		{
+			vertexArrays.put(glVao);
+			glVao = 0;
+		}
+
+		if (glVaoA != 0)
+		{
+			vertexArrays.put(glVaoA);
+			glVaoA = 0;
+		}
+
+		alphaModels.clear();
 	}
 
 	void free()
 	{
+		dropStaging();
+
 		if (vboO != null)
 		{
 			vboO.destroy();
@@ -126,28 +246,6 @@ class Zone
 		// don't add permanent alphamodels to the cache as permanent alphamodels are always allocated
 		// to avoid having to synchronize the cache
 		alphaModels.clear();
-	}
-
-	void unmap()
-	{
-		if (vboO != null)
-		{
-			vboO.unmap();
-		}
-		if (vboA != null)
-		{
-			vboA.unmap();
-		}
-
-		if (vboO != null)
-		{
-			this.bufLen = vboO.len / (VERT_SIZE / 4);
-		}
-
-		if (vboA != null)
-		{
-			this.bufLenA = vboA.len / (VERT_SIZE / 4);
-		}
 	}
 
 	private void setupVao(int vao, int buffer)

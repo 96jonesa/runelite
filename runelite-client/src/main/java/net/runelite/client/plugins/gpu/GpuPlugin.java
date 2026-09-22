@@ -36,10 +36,10 @@ import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
@@ -77,6 +77,7 @@ import net.runelite.client.plugins.gpu.template.Template;
 import net.runelite.client.ui.ClientUI;
 import net.runelite.client.ui.DrawManager;
 import net.runelite.rlawt.AWTContext;
+import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL;
 import static org.lwjgl.opengl.GL33C.*;
 import static org.lwjgl.opengl.GL43C.GL_DEBUG_SOURCE_API;
@@ -187,6 +188,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private RenderThread[] rts;
 
 	private SceneUploader clientUploader, mapUploader;
+	// CPU memory zone vertex data is written into before it is committed to GL; see arena()
+	private IntBuffer stagingArena; // client thread
+	private IntBuffer loaderArena; // map loader thread
+
+	// the old scene's GL objects, collected for one batched delete at swap
+	private final IntBuffer deleteBuffers = BufferUtils.createIntBuffer(2 * NUM_ZONES * NUM_ZONES);
+	private final IntBuffer deleteVertexArrays = BufferUtils.createIntBuffer(2 * NUM_ZONES * NUM_ZONES);
 
 	static class SceneContext
 	{
@@ -247,8 +255,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private SceneContext root;
 	private SceneContext[] subs;
-	private Zone[][] nextZones;
-	private Map<Integer, Integer> nextRoofChanges;
+
+	// handed from loadScene (map loader thread) to swapScene (client thread) by the client's own load
+	// handoff, the same way the built scene itself is. nextScene is written last and read first.
+	private volatile Scene nextScene;
+	private volatile Zone[][] nextZones;
+	private volatile Map<Integer, Integer> nextRoofChanges;
 
 	// Uniforms
 	private int uniUseFog;
@@ -449,6 +461,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			client.setDrawCallbacks(null);
 			client.setUnlockedFps(false);
 			client.setExpandedMapLoading(0);
+
+			stagingArena = null;
+			loaderArena = null;
 
 			if (lwjglInitted)
 			{
@@ -1396,29 +1411,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				Scene scene = wv.getScene();
 				clientUploader.zoneSize(scene, zone, x, z);
-
-				VBO o = null, a = null;
-				int sz = zone.sizeO * Zone.VERT_SIZE * 3;
-				if (sz > 0)
-				{
-					o = new VBO(sz);
-					o.init(GL_STATIC_DRAW);
-					o.map();
-				}
-
-				sz = zone.sizeA * Zone.VERT_SIZE * 3;
-				if (sz > 0)
-				{
-					a = new VBO(sz);
-					a.init(GL_STATIC_DRAW);
-					a.map();
-				}
-
-				zone.init(o, a);
-
+				zone.stage(arena(true, zone.stagingInts()));
 				clientUploader.uploadZone(scene, zone, x, z);
-
-				zone.unmap();
+				zone.commit();
 				zone.initialized = true;
 				zone.dirty = true;
 
@@ -1646,6 +1641,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			// this is to avoid scene fbo blit when going from <loading to >=loading,
 			// but keep it when doing >loading to loading
 			sceneFboValid = false;
+			// a load in flight is dropped by the client; don't keep its scene alive
+			nextScene = null;
+			nextZones = null;
+			nextRoofChanges = null;
 		}
 		if (state == GameState.STARTING)
 		{
@@ -1667,45 +1666,38 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		if (nextZones != null)
-		{
-			log.debug("Double zone load!");
-			// The previous scene load just gets dropped, this is uncommon and requires a back to back map build packet
-			// while having the first load take more than a full server cycle to complete
-			CountDownLatch latch = new CountDownLatch(1);
-			clientThread.invoke(() ->
-			{
-				for (int x = 0; x < NUM_ZONES; ++x)
-				{
-					for (int z = 0; z < NUM_ZONES; ++z)
-					{
-						Zone zone = nextZones[x][z];
-						assert !zone.cull;
-						// anything initialized is a reused zone and so shouldn't be freed
-						if (!zone.initialized)
-						{
-							zone.unmap();
-							zone.initialized = true;
-							zone.free();
-						}
-					}
-				}
-				latch.countDown();
-			});
-			try
-			{
-				latch.await();
-			}
-			catch (InterruptedException e)
-			{
-				throw new RuntimeException(e);
-			}
-			nextZones = null;
-			nextRoofChanges = null;
-		}
+		// The world view still points at the outgoing scene here; by the swap it may not.
+		final Scene prev = client.getTopLevelWorldView().getScene();
+		final GameState gameState = client.getGameState();
 
+		// The whole scene is prepared on the loader thread, in CPU staging and without any GL, so this never
+		// waits for the client thread; the swap only commits it.
+		Stopwatch swLoad = Stopwatch.createStarted();
+		Map<Integer, Integer> roofChanges = new HashMap<>();
+		Zone[][] newZones = planScene(scene, prev, mayReuse(prev, scene, gameState), roofChanges);
+		uploadZones(scene, newZones, false);
+		nextRoofChanges = roofChanges;
+		nextZones = newZones;
+		nextScene = scene;
+		log.debug("Scene load time {}", swLoad);
+	}
+
+	/**
+	 * Zones are reused only while walking within the same world; every other kind of load rebuilds them all.
+	 */
+	private static boolean mayReuse(Scene prev, Scene scene, GameState gameState)
+	{
+		return prev.isInstance() == scene.isInstance() && gameState == GameState.LOGGED_IN;
+	}
+
+	/**
+	 * Decide which of the current zones the new scene keeps and allocate the rest: every current zone is
+	 * marked cull, then the reused ones are unmarked and placed in the new table. Runs on the loader thread
+	 * with deferral off and on the client thread with it on; the swap consumes the result either way.
+	 */
+	private Zone[][] planScene(Scene scene, Scene prev, boolean mayReuse, Map<Integer, Integer> roofChanges)
+	{
 		SceneContext ctx = root;
-		Scene prev = client.getTopLevelWorldView().getScene();
 
 		regionManager.prepare(scene);
 
@@ -1723,13 +1715,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
-		Map<Integer, Integer> roofChanges = new HashMap<>();
-
 		// find zones which overlap and copy them
 		Zone[][] newZones = new Zone[SCENE_ZONES][SCENE_ZONES];
-		final GameState gameState = client.getGameState();
-		if (prev.isInstance() == scene.isInstance()
-			&& gameState == GameState.LOGGED_IN)
+		if (mayReuse)
 		{
 			int[][][] prevTemplates = prev.getInstanceTemplateChunks();
 			int[][][] curTemplates = scene.getInstanceTemplateChunks();
@@ -1836,11 +1824,46 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 		}
+		return newZones;
+	}
 
-		// size the zones which require upload
+	/**
+	 * Size, stage and fill every new zone of the new table. On the loader thread that is with the loader's
+	 * uploader and arena, committed later by the swap; on the client thread (a swap without a matching
+	 * load) with the client's, committed here.
+	 */
+	private void uploadZones(Scene scene, Zone[][] newZones, boolean onClientThread)
+	{
+		final SceneUploader uploader = onClientThread ? clientUploader : mapUploader;
 		Stopwatch sw = Stopwatch.createStarted();
 		int len = 0, lena = 0;
-		int reused = 0, newzones = 0;
+		int reused = 0, near = 0;
+		for (int x = 0; x < NUM_ZONES; ++x)
+		{
+			for (int z = 0; z < NUM_ZONES; ++z)
+			{
+				Zone zone = newZones[x][z];
+				if (zone.initialized)
+				{
+					reused++;
+					continue;
+				}
+
+				assert zone.glVao == 0;
+				assert zone.glVaoA == 0;
+				uploader.zoneSize(scene, zone, x, z);
+				len += zone.sizeO;
+				lena += zone.sizeA;
+				near++;
+			}
+		}
+		log.debug("Scene size time {} reused {} new {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
+			sw, reused, near,
+			len, (len * Zone.VERT_SIZE * 3) / 1024,
+			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
+
+		IntBuffer arena = arena(onClientThread, (len + lena) * 3 * (Zone.VERT_SIZE / 4));
+		sw = Stopwatch.createStarted();
 		for (int x = 0; x < NUM_ZONES; ++x)
 		{
 			for (int z = 0; z < NUM_ZONES; ++z)
@@ -1848,89 +1871,44 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				Zone zone = newZones[x][z];
 				if (!zone.initialized)
 				{
-					assert zone.glVao == 0;
-					assert zone.glVaoA == 0;
-					mapUploader.zoneSize(scene, zone, x, z);
-					len += zone.sizeO;
-					lena += zone.sizeA;
-					newzones++;
-				}
-				else
-				{
-					reused++;
-				}
-			}
-		}
-		log.debug("Scene size time {} reused {} new {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
-			sw, reused, newzones,
-			len, (len * Zone.VERT_SIZE * 3) / 1024,
-			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
-
-		// allocate buffers for zones which require upload
-		CountDownLatch latch = new CountDownLatch(1);
-		clientThread.invoke(() ->
-		{
-			for (int x = 0; x < Constants.EXTENDED_SCENE_SIZE >> 3; ++x)
-			{
-				for (int z = 0; z < Constants.EXTENDED_SCENE_SIZE >> 3; ++z)
-				{
-					Zone zone = newZones[x][z];
-
-					if (zone.initialized)
+					zone.stage(arena);
+					uploader.uploadZone(scene, zone, x, z);
+					if (onClientThread)
 					{
-						continue;
+						zone.commit();
+						zone.initialized = true;
 					}
-
-					VBO o = null, a = null;
-					int sz = zone.sizeO * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						o = new VBO(sz);
-						o.init(GL_STATIC_DRAW);
-						o.map();
-					}
-
-					sz = zone.sizeA * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						a = new VBO(sz);
-						a.init(GL_STATIC_DRAW);
-						a.map();
-					}
-
-					zone.init(o, a);
-				}
-			}
-
-			latch.countDown();
-		});
-		try
-		{
-			latch.await();
-		}
-		catch (InterruptedException e)
-		{
-			throw new RuntimeException(e);
-		}
-
-		// upload zones
-		sw = Stopwatch.createStarted();
-		for (int x = 0; x < Constants.EXTENDED_SCENE_SIZE >> 3; ++x)
-		{
-			for (int z = 0; z < Constants.EXTENDED_SCENE_SIZE >> 3; ++z)
-			{
-				Zone zone = newZones[x][z];
-
-				if (!zone.initialized)
-				{
-					mapUploader.uploadZone(scene, zone, x, z);
 				}
 			}
 		}
 		log.debug("Scene upload time {}", sw);
+	}
 
-		nextZones = newZones;
-		nextRoofChanges = roofChanges;
+	/**
+	 * The staging arena for the calling thread, cleared and grown to hold at least ints. One arena serves
+	 * the client thread (near zones at swap, one zone at a time in rebuild) and one the loader thread
+	 * (whole scenes with deferral off); each only ever holds zones its own next commit consumes.
+	 */
+	private IntBuffer arena(boolean onClientThread, int ints)
+	{
+		IntBuffer arena = onClientThread ? stagingArena : loaderArena;
+		if (arena == null || arena.capacity() < ints)
+		{
+			int oldCapacity = arena == null ? 0 : arena.capacity();
+			int capacity = Math.max(ints, oldCapacity + oldCapacity / 4);
+			log.debug("Staging arena ({}) {}kb -> {}kb", onClientThread ? "client" : "loader", oldCapacity * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
+			arena = GpuIntBuffer.allocateDirect(capacity);
+			if (onClientThread)
+			{
+				stagingArena = arena;
+			}
+			else
+			{
+				loaderArena = arena;
+			}
+		}
+		arena.clear();
+		return arena;
 	}
 
 	private static boolean canReuse(Zone[][] zones, int zx, int zz)
@@ -1989,46 +1967,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
-		// allocate buffers for zones which require upload
-		CountDownLatch latch = new CountDownLatch(1);
-		clientThread.invoke(() ->
+		// stage in CPU memory; swapSub creates the GL buffers. Sub scenes get their own staging because
+		// a top level load may reuse the arena before this scene is swapped in.
+		for (int x = 0; x < ctx.sizeX; ++x)
 		{
-			for (int x = 0; x < ctx.sizeX; ++x)
+			for (int z = 0; z < ctx.sizeZ; ++z)
 			{
-				for (int z = 0; z < ctx.sizeZ; ++z)
-				{
-					Zone zone = ctx.zones[x][z];
-
-					VBO o = null, a = null;
-					int sz = zone.sizeO * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						o = new VBO(sz);
-						o.init(GL_STATIC_DRAW);
-						o.map();
-					}
-
-					sz = zone.sizeA * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						a = new VBO(sz);
-						a.init(GL_STATIC_DRAW);
-						a.map();
-					}
-
-					zone.init(o, a);
-				}
+				ctx.zones[x][z].stage();
 			}
-
-			latch.countDown();
-		});
-		try
-		{
-			latch.await();
-		}
-		catch (InterruptedException e)
-		{
-			throw new RuntimeException(e);
 		}
 
 		for (int x = 0; x < ctx.sizeX; ++x)
@@ -2069,45 +2015,75 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		Stopwatch swSwap = Stopwatch.createStarted();
+
+		final boolean matched = nextScene == scene;
+		final Zone[][] prepared = matched ? nextZones : null;
+		final Map<Integer, Integer> roofChanges = prepared != null ? nextRoofChanges : new HashMap<>();
+		nextScene = null;
+		nextZones = null;
+		nextRoofChanges = null;
+
 		SceneContext ctx = root;
+		final Zone[][] newZones;
+		if (prepared != null)
+		{
+			// the loader thread sized, staged and filled every zone; commit them
+			newZones = prepared;
+			for (int x = 0; x < NUM_ZONES; ++x)
+			{
+				for (int z = 0; z < NUM_ZONES; ++z)
+				{
+					Zone zone = newZones[x][z];
+					if (!zone.initialized)
+					{
+						zone.commit();
+						zone.initialized = true;
+					}
+				}
+			}
+		}
+		else
+		{
+			// no matching loadScene (the plugin started mid load): build everything here, reusing nothing
+			log.warn("swapScene without a matching loadScene, nothing is reused");
+			newZones = planScene(scene, scene, false, roofChanges);
+			uploadZones(scene, newZones, true);
+		}
+
+		// Free the old zones that were not reused with one batched delete, carry the roof id changes into
+		// the reused ones, then install the new table.
+		deleteBuffers.clear();
+		deleteVertexArrays.clear();
 		for (int x = 0; x < ctx.sizeX; ++x)
 		{
 			for (int z = 0; z < ctx.sizeZ; ++z)
 			{
 				Zone zone = ctx.zones[x][z];
-
 				if (zone.cull)
 				{
-					zone.free();
+					zone.freeInto(deleteBuffers, deleteVertexArrays);
 				}
 				else
 				{
-					// reused zone
-					zone.updateRoofs(nextRoofChanges);
+					zone.updateRoofs(roofChanges);
 				}
 			}
 		}
-		nextRoofChanges = null;
-
-		ctx.zones = nextZones;
-		nextZones = null;
-
-		// setup vaos
-		for (int x = 0; x < ctx.zones.length; ++x) // NOPMD: ForLoopCanBeForeach
+		deleteBuffers.flip();
+		deleteVertexArrays.flip();
+		if (deleteBuffers.hasRemaining())
 		{
-			for (int z = 0; z < ctx.zones[0].length; ++z)
-			{
-				Zone zone = ctx.zones[x][z];
-
-				if (!zone.initialized)
-				{
-					zone.unmap();
-					zone.initialized = true;
-				}
-			}
+			glDeleteBuffers(deleteBuffers);
 		}
+		if (deleteVertexArrays.hasRemaining())
+		{
+			glDeleteVertexArrays(deleteVertexArrays);
+		}
+		ctx.zones = newZones;
 
 		checkGLErrors();
+		log.debug("Scene swap time {}", swSwap);
 	}
 
 	private void swapSub(Scene scene)
@@ -2127,7 +2103,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				if (!zone.initialized)
 				{
-					zone.unmap();
+					zone.commit();
 					zone.initialized = true;
 				}
 			}
