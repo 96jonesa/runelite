@@ -199,6 +199,29 @@ class DeferredZoneUploader
 		}
 	}
 
+	/**
+	 * Like {@link #cancel()} but without waiting for the zone being filled. For callers that will not touch
+	 * the pending zones afterwards (the swap drops them unfreed, since they hold no GL objects); the next
+	 * drain still runs after this one on the single worker thread, so the worker's arena is not reused
+	 * under it.
+	 */
+	void abandon()
+	{
+		int dropped;
+		synchronized (this)
+		{
+			dropped = scheduler.size();
+			scheduler.cancel();
+			completed.clear();
+			drain = null;
+		}
+
+		if (dropped > 0)
+		{
+			log.debug("Deferred upload abandoned with {} zones pending", dropped);
+		}
+	}
+
 	void shutdown()
 	{
 		cancel();

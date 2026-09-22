@@ -77,6 +77,7 @@ import net.runelite.client.plugins.gpu.template.Template;
 import net.runelite.client.ui.ClientUI;
 import net.runelite.client.ui.DrawManager;
 import net.runelite.rlawt.AWTContext;
+import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL;
 import static org.lwjgl.opengl.GL33C.*;
 import static org.lwjgl.opengl.GL43C.GL_DEBUG_SOURCE_API;
@@ -193,6 +194,10 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	// CPU memory zone vertex data is written into before it is committed to GL; see arena()
 	private IntBuffer stagingArena; // client thread
 	private IntBuffer loaderArena; // map loader thread
+
+	// the old scene's GL objects, collected for one batched delete at swap
+	private final IntBuffer deleteBuffers = BufferUtils.createIntBuffer(2 * NUM_ZONES * NUM_ZONES);
+	private final IntBuffer deleteVertexArrays = BufferUtils.createIntBuffer(2 * NUM_ZONES * NUM_ZONES);
 
 	// timing of the client's part of a scene load, for the debug log
 	private volatile long loadSceneDoneNanos;
@@ -2093,11 +2098,13 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		SceneContext ctx = root;
 		final Zone[][] newZones;
 		final int pending;
+		long tPlan = 0, tNear = 0;
 		if (prepared != null)
 		{
 			// deferral off: the loader thread sized, staged and filled every zone; commit them
 			newZones = prepared;
 			pending = 0;
+			long t0 = System.nanoTime();
 			for (int x = 0; x < NUM_ZONES; ++x)
 			{
 				for (int z = 0; z < NUM_ZONES; ++z)
@@ -2110,59 +2117,81 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					}
 				}
 			}
+			tNear = System.nanoTime() - t0;
 		}
 		else
 		{
 			// deferral on: the plugin's whole share of the load happens here, after the client has noticed
 			// the build. Zones the worker has already filled are committed first so the new scene can reuse
-			// them; whatever is still pending is culled and freed below like any other unused zone.
+			// them; whatever is still pending is dropped below without waiting for the worker, since such
+			// zones hold no GL objects.
+			long t0 = System.nanoTime();
 			deferredUploader.commitFinished();
-			deferredUploader.cancel();
+			deferredUploader.abandon();
 			// Zones are reused only while walking within the same world; every other kind of load rebuilds
 			final boolean mayReuse = matched
 				&& prev.isInstance() == scene.isInstance()
 				&& gameState == GameState.LOGGED_IN;
 			newZones = planScene(scene, prev, mayReuse, roofChanges);
+			long t1 = System.nanoTime();
+			tPlan = t1 - t0;
 			// filled and committed before the table is installed, so a failure here leaves the old scene intact.
 			// An unmatched swap lands here with deferral off too; then nothing is deferred.
 			pending = uploadNear(scene, newZones, config.deferredSceneUpload(), clientUploader, true);
+			tNear = System.nanoTime() - t1;
 		}
 
-		// free the old zones that were not reused (cancelled pending zones among them, which hold only
-		// staging), carry the roof id changes into the reused ones, then install the new table
+		// Free the old zones that were not reused with one batched delete, carry the roof id changes into
+		// the reused ones, then install the new table. Zones still pending hold no GL objects and may
+		// still be written by the worker, so they are simply dropped.
+		long tFree0 = System.nanoTime();
+		deleteBuffers.clear();
+		deleteVertexArrays.clear();
 		for (int x = 0; x < ctx.sizeX; ++x)
 		{
 			for (int z = 0; z < ctx.sizeZ; ++z)
 			{
 				Zone zone = ctx.zones[x][z];
-				if (zone.cull)
-				{
-					zone.free();
-				}
-				else
+				if (!zone.cull)
 				{
 					zone.updateRoofs(roofChanges);
 				}
+				else if (!zone.pending)
+				{
+					zone.freeInto(deleteBuffers, deleteVertexArrays);
+				}
+				else
+				{
+					assert zone.glVao == 0 && zone.glVaoA == 0;
+				}
 			}
 		}
+		deleteBuffers.flip();
+		deleteVertexArrays.flip();
+		if (deleteBuffers.hasRemaining())
+		{
+			glDeleteBuffers(deleteBuffers);
+		}
+		if (deleteVertexArrays.hasRemaining())
+		{
+			glDeleteVertexArrays(deleteVertexArrays);
+		}
 		ctx.zones = newZones;
+		long tFree = System.nanoTime() - tFree0;
 
 		checkGLErrors();
 
+		long tStart0 = System.nanoTime();
 		if (pending > 0)
 		{
 			deferredUploader.start(scene, ctx.zones);
 		}
+		long tStart = System.nanoTime() - tStart0;
 		swapNanos = System.nanoTime();
 		awaitingFirstFrame = true;
-		if (matched)
-		{
-			log.debug("Scene swap time {} pending {}, began {} after loadScene returned", swSwap, pending, millis(sinceLoad));
-		}
-		else
-		{
-			log.debug("Scene swap time {} pending {}", swSwap, pending);
-		}
+		log.debug("Scene swap time {} (plan {}, near {}, free {}, start {}) pending {}{}", swSwap,
+			millis(tPlan), millis(tNear), millis(tFree), millis(tStart), pending,
+			matched ? ", began " + millis(sinceLoad) + " after loadScene returned" : "");
 	}
 
 	private void swapSub(Scene scene)

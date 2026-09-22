@@ -178,6 +178,43 @@ class Zone
 		stageA = null;
 	}
 
+	/**
+	 * Like free(), but the GL objects are appended to the given buffers for one batched delete instead of
+	 * being deleted here, so freeing a whole scene costs two GL calls rather than four per zone. No GL.
+	 */
+	void freeInto(IntBuffer buffers, IntBuffer vertexArrays)
+	{
+		dropStaging();
+
+		if (vboO != null)
+		{
+			assert !vboO.mapped;
+			buffers.put(vboO.bufId);
+			vboO = null;
+		}
+
+		if (vboA != null)
+		{
+			assert !vboA.mapped;
+			buffers.put(vboA.bufId);
+			vboA = null;
+		}
+
+		if (glVao != 0)
+		{
+			vertexArrays.put(glVao);
+			glVao = 0;
+		}
+
+		if (glVaoA != 0)
+		{
+			vertexArrays.put(glVaoA);
+			glVaoA = 0;
+		}
+
+		alphaModels.clear();
+	}
+
 	void free()
 	{
 		dropStaging();
