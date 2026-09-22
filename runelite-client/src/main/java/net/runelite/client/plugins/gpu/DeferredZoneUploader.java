@@ -52,11 +52,13 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
  * invalidate flag set, and rebuilt from the current scene contents by the plugin's normal rebuild
  * path on the client thread.
  * <p>
- * The next scene calls {@link #cancel()} before it frees the zones still pending, which drops the queue
- * and waits for the zone being filled; a completion still queued then carries a stale generation and is
- * ignored. With deferral on that happens in the swap, on the client thread; with it off, in loadScene on
- * the loader thread, which is why the generation check and the commit in {@link #finish} share the
- * monitor cancel() bumps the generation under.
+ * The next scene stops this one's worker first. The swap (client thread) calls {@link #abandon()}: it
+ * drops the queue and lets the zone being filled finish on its own, since that zone leaves the live
+ * table without ever holding GL objects. A load with deferral off (loader thread) and shutdown call
+ * {@link #cancel()}, which also waits for the zone being filled before the caller frees zones. Either
+ * way a completion still queued afterwards carries a stale generation and is ignored; the generation
+ * check and the commit in {@link #finish} share the monitor the generation is bumped under because
+ * cancel() may run on the loader thread.
  */
 @Slf4j
 class DeferredZoneUploader
@@ -154,7 +156,8 @@ class DeferredZoneUploader
 
 		synchronized (this)
 		{
-			assert drain == null || drain.isDone() : "deferred upload started while the previous one is running";
+			// an abandoned drain may still be running; the single worker thread runs this one after it, so the
+			// arena reset at the top of drain() cannot clobber a slice the old one is writing
 			final int gen = scheduler.generation();
 			drain = executor.submit(() -> drain(scene, gen));
 		}
@@ -189,7 +192,8 @@ class DeferredZoneUploader
 			}
 			catch (ExecutionException e)
 			{
-				log.error("Deferred upload worker died", e.getCause());
+				// already logged by drain(); nothing more to do than not to wait on it
+				log.debug("Deferred upload worker had died", e.getCause());
 			}
 		}
 
@@ -231,8 +235,21 @@ class DeferredZoneUploader
 	// worker thread
 	private void drain(Scene scene, int gen)
 	{
-		// every slice of the previous drain has been committed or dropped by now: the next load cancels
-		// this worker and drops the staging of whatever it left pending before the swap starts a new drain
+		try
+		{
+			drainZones(scene, gen);
+		}
+		catch (Throwable ex) // an abandoned drain has no cancel() to report through, so log here
+		{
+			log.error("Deferred upload worker died", ex);
+			throw ex;
+		}
+	}
+
+	private void drainZones(Scene scene, int gen)
+	{
+		// every slice of the previous drain has been committed or dropped by now: the previous drain has
+		// returned (same thread) and its zones were either committed or left the live table at the swap
 		if (arena != null)
 		{
 			arena.clear();
