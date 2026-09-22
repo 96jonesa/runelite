@@ -32,6 +32,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Scene;
 import net.runelite.client.callback.RenderCallbackManager;
@@ -66,6 +67,8 @@ class DeferredZoneUploader
 	private final SceneUploader uploader;
 	private final DeferredUploadScheduler scheduler = new DeferredUploadScheduler();
 	private final ExecutorService executor;
+	// creates a finished zone's GL objects; Zone::commit outside of tests
+	private final Consumer<Zone> committer;
 
 	private static final class Completion
 	{
@@ -103,13 +106,19 @@ class DeferredZoneUploader
 
 	DeferredZoneUploader(RenderCallbackManager renderCallbackManager)
 	{
-		this.uploader = new SceneUploader(renderCallbackManager);
-		this.executor = Executors.newSingleThreadExecutor(r ->
+		this(new SceneUploader(renderCallbackManager), Executors.newSingleThreadExecutor(r ->
 		{
 			Thread t = new Thread(r, "GPU deferred upload");
 			t.setDaemon(true);
 			return t;
-		});
+		}), Zone::commit);
+	}
+
+	DeferredZoneUploader(SceneUploader uploader, ExecutorService executor, Consumer<Zone> committer)
+	{
+		this.uploader = uploader;
+		this.executor = executor;
+		this.committer = committer;
 	}
 
 	/**
@@ -325,7 +334,7 @@ class DeferredZoneUploader
 				return;
 			}
 
-			zone.commit();
+			committer.accept(zone);
 		}
 		zone.initialized = true;
 		zone.pending = false;

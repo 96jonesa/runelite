@@ -199,12 +199,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private final IntBuffer deleteBuffers = BufferUtils.createIntBuffer(2 * NUM_ZONES * NUM_ZONES);
 	private final IntBuffer deleteVertexArrays = BufferUtils.createIntBuffer(2 * NUM_ZONES * NUM_ZONES);
 
-	// timing of the client's part of a scene load, for the debug log
-	private volatile long loadSceneDoneNanos;
-	private long swapNanos;
-	private boolean awaitingFirstFrame;
-	private boolean awaitingFirstSceneDraw;
-
 	static class SceneContext
 	{
 		final float[] projection = Mat4.identity();
@@ -898,12 +892,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			this.cameraYaw = client.getCameraYaw();
 			this.cameraPitch = client.getCameraPitch();
 			// zones the worker finished during the previous frame are drawn in this one
-			int landed = deferredUploader.commitFinished();
-			if (awaitingFirstSceneDraw)
-			{
-				awaitingFirstSceneDraw = false;
-				log.trace("First scene draw after swap began {} later with {} deferred zones landed in time for it", millis(System.nanoTime() - swapNanos), landed);
-			}
+			deferredUploader.commitFinished();
 			deferredUploader.setFocus((ctx.cameraX >> 10) + (SCENE_OFFSET >> 3), (ctx.cameraZ >> 10) + (SCENE_OFFSET >> 3));
 			preSceneDrawToplevel(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw);
 		}
@@ -1501,12 +1490,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	public void draw(int overlayColor)
 	{
-		if (awaitingFirstFrame)
-		{
-			awaitingFirstFrame = false;
-			log.trace("First frame after swap reached draw {} after the swap", millis(System.nanoTime() - swapNanos));
-		}
-
 		final GameState gameState = client.getGameState();
 		if (gameState == GameState.STARTING)
 		{
@@ -1726,7 +1709,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			nextPrevScene = prev;
 			nextGameState = gameState;
 			nextScene = scene;
-			loadSceneDoneNanos = System.nanoTime();
 			return;
 		}
 
@@ -1743,7 +1725,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		nextPrevScene = prev;
 		nextGameState = gameState;
 		nextScene = scene;
-		loadSceneDoneNanos = System.nanoTime();
 		log.debug("Scene load time {}", swLoad);
 	}
 
@@ -1756,9 +1737,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	{
 		SceneContext ctx = root;
 
-		long t0 = System.nanoTime();
 		regionManager.prepare(scene);
-		long t1 = System.nanoTime();
 
 		int dx = scene.getBaseX() - prev.getBaseX() >> 3;
 		int dy = scene.getBaseY() - prev.getBaseY() >> 3;
@@ -1872,7 +1851,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
-		long t2 = System.nanoTime();
 		// Fill out any zones that weren't copied
 		for (int x = 0; x < SCENE_ZONES; ++x)
 		{
@@ -1884,8 +1862,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 		}
-		log.trace("Scene plan: regions {}, reuse {} (mayReuse {}), alloc {}", millis(t1 - t0), millis(t2 - t1), mayReuse, millis(System.nanoTime() - t2));
-
 		return newZones;
 	}
 
@@ -2089,7 +2065,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		Stopwatch swSwap = Stopwatch.createStarted();
-		final long sinceLoad = System.nanoTime() - loadSceneDoneNanos;
 
 		final boolean matched = nextScene == scene;
 		final Scene prev = matched ? nextPrevScene : scene;
@@ -2108,13 +2083,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		SceneContext ctx = root;
 		final Zone[][] newZones;
 		final int pending;
-		long tPlan = 0, tNear = 0;
 		if (prepared != null)
 		{
 			// deferral off: the loader thread sized, staged and filled every zone; commit them
 			newZones = prepared;
 			pending = 0;
-			long t0 = System.nanoTime();
 			for (int x = 0; x < NUM_ZONES; ++x)
 			{
 				for (int z = 0; z < NUM_ZONES; ++z)
@@ -2127,7 +2100,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					}
 				}
 			}
-			tNear = System.nanoTime() - t0;
 		}
 		else
 		{
@@ -2135,7 +2107,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			// the build. Zones the worker has already filled are committed first so the new scene can reuse
 			// them; whatever is still pending is dropped below without waiting for the worker, since such
 			// zones hold no GL objects.
-			long t0 = System.nanoTime();
 			deferredUploader.commitFinished();
 			deferredUploader.abandon();
 			// Zones are reused only while walking within the same world; every other kind of load rebuilds
@@ -2143,18 +2114,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				&& prev.isInstance() == scene.isInstance()
 				&& gameState == GameState.LOGGED_IN;
 			newZones = planScene(scene, prev, mayReuse, roofChanges);
-			long t1 = System.nanoTime();
-			tPlan = t1 - t0;
 			// filled and committed before the table is installed, so a failure here leaves the old scene intact.
 			// An unmatched swap lands here with deferral off too; then nothing is deferred.
 			pending = uploadNear(scene, newZones, config.deferredSceneUpload(), clientUploader, true);
-			tNear = System.nanoTime() - t1;
 		}
 
 		// Free the old zones that were not reused with one batched delete, carry the roof id changes into
 		// the reused ones, then install the new table. Zones still pending hold no GL objects and may
 		// still be written by the worker, so they are simply dropped.
-		long tFree0 = System.nanoTime();
 		deleteBuffers.clear();
 		deleteVertexArrays.clear();
 		for (int x = 0; x < ctx.sizeX; ++x)
@@ -2187,25 +2154,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			glDeleteVertexArrays(deleteVertexArrays);
 		}
 		ctx.zones = newZones;
-		long tFree = System.nanoTime() - tFree0;
 
 		checkGLErrors();
 
-		long tStart0 = System.nanoTime();
 		if (pending > 0)
 		{
 			deferredUploader.start(scene, ctx.zones);
 		}
-		long tStart = System.nanoTime() - tStart0;
-		swapNanos = System.nanoTime();
-		awaitingFirstFrame = true;
-		awaitingFirstSceneDraw = true;
-		log.debug("Scene swap time {} (plan {}, near {}, free {}, start {}) pending {}", swSwap,
-			millis(tPlan), millis(tNear), millis(tFree), millis(tStart), pending);
-		if (matched)
-		{
-			log.trace("Swap began {} after loadScene returned", millis(sinceLoad));
-		}
+		log.debug("Scene swap time {} pending {}", swSwap, pending);
 	}
 
 	private void swapSub(Scene scene)
@@ -2231,11 +2187,6 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 		log.debug("WorldView ready: {}", scene.getWorldViewId());
-	}
-
-	private static String millis(long nanos)
-	{
-		return String.format("%.2f ms", nanos / 1e6);
 	}
 
 	private int getScaledValue(final double scale, final int value)
