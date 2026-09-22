@@ -27,7 +27,10 @@ package net.runelite.client.plugins.gpu;
 import com.google.common.util.concurrent.MoreExecutors;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import net.runelite.api.Scene;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -40,6 +43,7 @@ import org.mockito.InOrder;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -214,6 +218,59 @@ public class DeferredZoneUploaderTest
 
 			assertEquals(0, h.deferred.commitFinished());
 			assertTrue(h.zones[2][0].pending);
+		}
+
+		/**
+		 * The difference between cancel() and abandon(): with a real worker thread stuck inside a fill,
+		 * abandon() returns at once and cancel() only after the fill has finished.
+		 */
+		@Test(timeout = 10_000)
+		public void waitsForTheFillInFlightWhereAbandonDoesNot() throws Exception
+		{
+			SceneUploader uploader = mock(SceneUploader.class);
+			Scene scene = mock(Scene.class);
+			ExecutorService worker = Executors.newSingleThreadExecutor();
+			DeferredZoneUploader deferred = new DeferredZoneUploader(uploader, worker, zone ->
+			{
+			});
+			Zone[][] zones = new Zone[1][1];
+			zones[0][0] = new Zone();
+			zones[0][0].pending = true;
+			CountDownLatch fillStarted = new CountDownLatch(1);
+			CountDownLatch releaseFill = new CountDownLatch(1);
+			doAnswer(invocation ->
+			{
+				fillStarted.countDown();
+				releaseFill.await();
+				return null;
+			}).when(uploader).uploadZone(any(), any(), anyInt(), anyInt());
+			try
+			{
+				deferred.start(scene, zones);
+				assertTrue(fillStarted.await(5, TimeUnit.SECONDS));
+
+				deferred.abandon(); // returns while the fill is still blocked
+
+				zones[0][0].pending = true;
+				deferred.start(scene, zones); // queued behind the blocked fill on the single worker thread
+				CountDownLatch cancelReturned = new CountDownLatch(1);
+				Thread canceller = new Thread(() ->
+				{
+					deferred.cancel();
+					cancelReturned.countDown();
+				});
+				canceller.start();
+				assertFalse("cancel must not return while the worker is inside a fill", cancelReturned.await(300, TimeUnit.MILLISECONDS));
+
+				releaseFill.countDown();
+				assertTrue(cancelReturned.await(5, TimeUnit.SECONDS));
+				canceller.join();
+			}
+			finally
+			{
+				releaseFill.countDown();
+				worker.shutdownNow();
+			}
 		}
 	}
 

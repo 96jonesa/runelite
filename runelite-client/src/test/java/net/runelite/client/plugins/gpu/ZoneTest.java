@@ -34,7 +34,8 @@ import org.junit.experimental.runners.Enclosed;
 import org.junit.runner.RunWith;
 
 /**
- * The staging side of Zone, which has no GL in it. commit() and free() do and are covered in game.
+ * The staging side of Zone, which has no GL in it, and the two commit() paths that make no GL call:
+ * an empty zone and a discarded one. A commit with data creates GL objects and is covered in game.
  */
 @RunWith(Enclosed.class)
 public class ZoneTest
@@ -157,6 +158,46 @@ public class ZoneTest
 		{
 			Zone z = zoneOf(0, 0);
 			z.discardUpload();
+			assertNull(z.stageO);
+			assertNull(z.stageA);
+		}
+	}
+
+	public static class Commit
+	{
+		@Test
+		public void anEmptyZoneCommitsToNothing()
+		{
+			Zone z = zoneOf(0, 0);
+			z.stage();
+
+			z.commit();
+
+			assertEquals(0, z.glVao);
+			assertEquals(0, z.glVaoA);
+			assertNull(z.vboO);
+			assertNull(z.vboA);
+			assertEquals(0, z.bufLen);
+			assertEquals(0, z.bufLenA);
+		}
+
+		@Test
+		public void aDiscardedZoneCommitsToNothing()
+		{
+			// the guarantee a failed deferred fill relies on: it is drawn as nothing until rebuilt
+			Zone z = zoneOf(2, 1);
+			z.stage();
+			z.stageO.put(1).put(2).put(3);
+			z.stageA.put(4);
+			z.discardUpload();
+
+			z.commit();
+
+			assertEquals(0, z.glVao);
+			assertEquals(0, z.glVaoA);
+			assertNull(z.vboO);
+			assertNull(z.vboA);
+			assertEquals(0, z.bufLen);
 			assertNull(z.stageO);
 			assertNull(z.stageA);
 		}

@@ -247,7 +247,7 @@ public interface GpuPluginConfig extends Config
 	@ConfigItem(
 		keyName = "deferredSceneUpload",
 		name = "Upload scenery after loading",
-		description = "Let the loading screen end before the plugin uploads the scene, then fill it in over the next few frames, nearest first. Takes the plugin's work out of the loading screen.",
+		description = "Finish loading before the plugin uploads scenery; distant scenery then pops in over the next few frames.",
 		position = 21
 	)
 	default boolean deferredSceneUpload()

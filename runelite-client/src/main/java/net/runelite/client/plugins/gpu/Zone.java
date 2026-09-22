@@ -159,7 +159,8 @@ class Zone
 			stageA = null;
 		}
 
-		// the static alpha models were recorded by the uploader before the vertex array existed
+		// the static alpha models were recorded by the uploader before the vertex array existed. A sub scene's
+		// zones are live before their swap, so one may also hold a temp model, which keeps its own vao.
 		for (AlphaModel m : alphaModels)
 		{
 			if (!m.isTemp() && (m.flags & AlphaModel.TEMP) == 0)

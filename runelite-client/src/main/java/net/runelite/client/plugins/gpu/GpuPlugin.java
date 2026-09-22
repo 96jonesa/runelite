@@ -1669,6 +1669,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			// a load in flight is dropped by the client; don't keep its scenes alive
 			nextScene = null;
 			nextPrevScene = null;
+			nextGameState = null;
 			nextZones = null;
 			nextRoofChanges = null;
 		}
@@ -1710,13 +1711,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		// Deferral off: the whole scene is prepared here as it always was, but in CPU staging and without
-		// any GL, so the swap only has to commit it.
+		// Deferral off: the whole scene is prepared on the loader thread, in CPU staging and without any GL,
+		// and the swap only commits it.
 		Stopwatch swLoad = Stopwatch.createStarted();
 		deferredUploader.abandon();
 		Map<Integer, Integer> roofChanges = new HashMap<>();
-		Zone[][] newZones = planScene(scene, prev,
-			prev.isInstance() == scene.isInstance() && gameState == GameState.LOGGED_IN, roofChanges);
+		Zone[][] newZones = planScene(scene, prev, mayReuse(prev, scene, gameState), roofChanges);
 		uploadZones(scene, newZones, false);
 		nextRoofChanges = roofChanges;
 		nextZones = newZones;
@@ -1724,6 +1724,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		nextGameState = gameState;
 		nextScene = scene;
 		log.debug("Scene load time {}", swLoad);
+	}
+
+	/**
+	 * Zones are reused only while walking within the same world; every other kind of load rebuilds them all.
+	 */
+	private static boolean mayReuse(Scene prev, Scene scene, GameState gameState)
+	{
+		return prev.isInstance() == scene.isInstance() && gameState == GameState.LOGGED_IN;
 	}
 
 	/**
@@ -1907,7 +1915,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				near++;
 			}
 		}
-		log.debug("Scene size time {} reused {} near {} deferred {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
+		log.debug("Scene size time {} reused {} new {} deferred {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
 			sw, reused, near, deferred,
 			len, (len * Zone.VERT_SIZE * 3) / 1024,
 			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
@@ -2075,6 +2083,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		final Map<Integer, Integer> roofChanges = prepared != null ? nextRoofChanges : new HashMap<>();
 		nextScene = null;
 		nextPrevScene = null;
+		nextGameState = null;
 		nextZones = null;
 		nextRoofChanges = null;
 		if (!matched)
@@ -2111,11 +2120,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			// zones hold no GL objects.
 			deferredUploader.commitFinished();
 			deferredUploader.abandon();
-			// Zones are reused only while walking within the same world; every other kind of load rebuilds
-			final boolean mayReuse = matched
-				&& prev.isInstance() == scene.isInstance()
-				&& gameState == GameState.LOGGED_IN;
-			newZones = planScene(scene, prev, mayReuse, roofChanges);
+			newZones = planScene(scene, prev, matched && mayReuse(prev, scene, gameState), roofChanges);
 			// filled and committed before the table is installed, so a failure here leaves the old scene intact.
 			// An unmatched swap lands here with deferral off too; then nothing is deferred.
 			pending = uploadZones(scene, newZones, true);

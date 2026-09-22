@@ -26,6 +26,7 @@ package net.runelite.client.plugins.gpu;
 
 import java.util.ArrayList;
 import java.util.List;
+import net.runelite.api.Constants;
 import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -89,13 +90,15 @@ public class DeferredUploadSchedulerTest
 		}
 
 		@Test
-		public void largeRadiusCoversWholeScene()
+		public void radiusFromTheCentreToTheEdgeCoversTheWholeScene()
 		{
-			for (int x = 0; x < 23; ++x)
+			final int zones = Constants.EXTENDED_SCENE_SIZE >> 3;
+			final int centre = zones >> 1;
+			for (int x = 0; x < zones; ++x)
 			{
-				for (int z = 0; z < 23; ++z)
+				for (int z = 0; z < zones; ++z)
 				{
-					assertTrue(DeferredUploadScheduler.isNear(x, z, 11, 11, 11));
+					assertTrue(DeferredUploadScheduler.isNear(x, z, centre, centre, centre));
 				}
 			}
 		}

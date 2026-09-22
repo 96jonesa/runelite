@@ -28,9 +28,9 @@ import com.google.common.base.Stopwatch;
 import com.google.common.util.concurrent.Uninterruptibles;
 import java.nio.IntBuffer;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 import java.util.function.Consumer;
 import lombok.extern.slf4j.Slf4j;
@@ -64,11 +64,32 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
 @Slf4j
 class DeferredZoneUploader
 {
+	private static final int MIN_ARENA_INTS = 4 << 20; // 16 MB
+
 	private final SceneUploader uploader;
 	private final DeferredUploadScheduler scheduler = new DeferredUploadScheduler();
 	private final ExecutorService executor;
 	// creates a finished zone's GL objects; Zone::commit outside of tests
 	private final Consumer<Zone> committer;
+
+	// zones the worker has filled, waiting for the client thread to commit them
+	private final ConcurrentLinkedQueue<Completion> completed = new ConcurrentLinkedQueue<>();
+
+	// worker thread only. Slices already handed to zones keep an outgrown arena alive until they commit.
+	private IntBuffer arena;
+
+	// zone nearest the camera, in extended zone coordinates; steers which pending zone is filled next
+	private volatile int focusX;
+	private volatile int focusZ;
+
+	// guarded by this
+	private Future<?> drain;
+
+	// client thread only
+	private int total;
+	private int finished;
+	private int failed;
+	private Stopwatch stopwatch;
 
 	private static final class Completion
 	{
@@ -83,26 +104,6 @@ class DeferredZoneUploader
 			this.uploaded = uploaded;
 		}
 	}
-
-	// zones the worker has filled, waiting for the client thread to commit them
-	private final ConcurrentLinkedQueue<Completion> completed = new ConcurrentLinkedQueue<>();
-
-	// worker thread only. Slices already handed to zones keep an outgrown arena alive until they commit.
-	private IntBuffer arena;
-	private static final int MIN_ARENA_INTS = 4 << 20; // 16 MB
-
-	// zone nearest the camera, in extended zone coordinates; steers which pending zone is filled next
-	private volatile int focusX;
-	private volatile int focusZ;
-
-	// guarded by this
-	private Future<?> drain;
-
-	// client thread only
-	private int total;
-	private int finished;
-	private int failed;
-	private Stopwatch stopwatch;
 
 	DeferredZoneUploader(RenderCallbackManager renderCallbackManager)
 	{
