@@ -1947,16 +1947,16 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	 * the client thread (near zones at swap, one zone at a time in rebuild) and one the loader thread
 	 * (whole scenes with deferral off); each only ever holds zones its own next commit consumes.
 	 */
-	private IntBuffer arena(boolean clientThread, int ints)
+	private IntBuffer arena(boolean onClientThread, int ints)
 	{
-		IntBuffer arena = clientThread ? stagingArena : loaderArena;
+		IntBuffer arena = onClientThread ? stagingArena : loaderArena;
 		if (arena == null || arena.capacity() < ints)
 		{
 			int oldCapacity = arena == null ? 0 : arena.capacity();
 			int capacity = Math.max(ints, oldCapacity + oldCapacity / 4);
-			log.debug("Staging arena ({}) {}kb -> {}kb", clientThread ? "client" : "loader", oldCapacity * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
+			log.debug("Staging arena ({}) {}kb -> {}kb", onClientThread ? "client" : "loader", oldCapacity * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
 			arena = GpuIntBuffer.allocateDirect(capacity);
-			if (clientThread)
+			if (onClientThread)
 			{
 				stagingArena = arena;
 			}
@@ -2123,8 +2123,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				&& prev.isInstance() == scene.isInstance()
 				&& gameState == GameState.LOGGED_IN;
 			newZones = planScene(scene, prev, mayReuse, roofChanges);
-			// filled and committed before the table is installed, so a failure here leaves the old scene intact
-			pending = uploadNear(scene, newZones, true, clientUploader, true);
+			// filled and committed before the table is installed, so a failure here leaves the old scene intact.
+			// An unmatched swap lands here with deferral off too; then nothing is deferred.
+			pending = uploadNear(scene, newZones, config.deferredSceneUpload(), clientUploader, true);
 		}
 
 		// free the old zones that were not reused (cancelled pending zones among them, which hold only
