@@ -26,10 +26,10 @@ package net.runelite.client.plugins.gpu;
 
 import com.google.common.base.Stopwatch;
 import com.google.common.util.concurrent.Uninterruptibles;
+import java.nio.IntBuffer;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.nio.IntBuffer;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
@@ -52,9 +52,11 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
  * invalidate flag set, and rebuilt from the current scene contents by the plugin's normal rebuild
  * path on the client thread.
  * <p>
- * The next scene load reuses the staging arena, so it calls {@link #cancel()} first, which drops the
- * queue and waits for the zone being filled; a completion that is still queued for the client thread
- * then carries a stale generation and is ignored rather than committing overwritten staging.
+ * The next scene calls {@link #cancel()} before it frees the zones still pending, which drops the queue
+ * and waits for the zone being filled; a completion still queued then carries a stale generation and is
+ * ignored. With deferral on that happens in the swap, on the client thread; with it off, in loadScene on
+ * the loader thread, which is why the generation check and the commit in {@link #finish} share the
+ * monitor cancel() bumps the generation under.
  */
 @Slf4j
 class DeferredZoneUploader
@@ -269,7 +271,7 @@ class DeferredZoneUploader
 	{
 		Zone zone = p.zone;
 		// the generation check and the commit are one step under the lock cancel() bumps the generation
-		// under, so a load that starts reusing the staging arena after cancel() can't race a commit
+		// under, so a cancel() from the loader thread can't interleave with a commit
 		synchronized (this)
 		{
 			if (!scheduler.isCurrent(gen) || !zone.pending)

@@ -190,9 +190,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private SceneUploader clientUploader, mapUploader;
 	private DeferredZoneUploader deferredUploader;
-	// CPU memory the client thread writes zone vertex data into before committing it to GL: the near zones
-	// at swap, one zone at a time in rebuild. Grown when a scene needs more.
-	private IntBuffer stagingArena;
+	// CPU memory zone vertex data is written into before it is committed to GL; see arena()
+	private IntBuffer stagingArena; // client thread
+	private IntBuffer loaderArena; // map loader thread
 
 	// timing of the client's part of a scene load, for the debug log
 	private volatile long loadSceneDoneNanos;
@@ -260,10 +260,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private SceneContext[] subs;
 
 	// handed from loadScene (map loader thread) to swapScene (client thread) by the client's own load
-	// handoff, the same way the built scene itself is
+	// handoff, the same way the built scene itself is. nextScene is written last and read first.
 	private volatile Scene nextScene;
 	private volatile Scene nextPrevScene;
 	private volatile GameState nextGameState;
+	private volatile Zone[][] nextZones; // prepared on the loader thread; only with deferral off
+	private volatile Map<Integer, Integer> nextRoofChanges;
 
 	// Uniforms
 	private int uniUseFog;
@@ -472,6 +474,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				deferredUploader.shutdown();
 			}
 			stagingArena = null;
+			loaderArena = null;
 
 			if (lwjglInitted)
 			{
@@ -1435,13 +1438,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				Scene scene = wv.getScene();
 				clientUploader.zoneSize(scene, zone, x, z);
-				int stagingInts = zone.stagingInts();
-				if (stagingArena == null || stagingArena.capacity() < stagingInts)
-				{
-					stagingArena = GpuIntBuffer.allocateDirect(stagingInts);
-				}
-				stagingArena.clear();
-				zone.stage(stagingArena);
+				zone.stage(arena(true, zone.stagingInts()));
 				clientUploader.uploadZone(scene, zone, x, z);
 				zone.commit();
 				zone.initialized = true;
@@ -1677,6 +1674,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			// this is to avoid scene fbo blit when going from <loading to >=loading,
 			// but keep it when doing >loading to loading
 			sceneFboValid = false;
+			// a load in flight is dropped by the client; don't keep its scenes alive
+			nextScene = null;
+			nextPrevScene = null;
+			nextZones = null;
+			nextRoofChanges = null;
 		}
 		if (state == GameState.STARTING)
 		{
@@ -1698,14 +1700,273 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		// The client calls this on its map loader thread and only notices that the build has finished once
-		// per game cycle, so anything done here is rounded up to that cycle. Record what the swap needs and
-		// return: the plugin's whole share of a load happens in swapScene, on the client thread, after the
-		// client has noticed. The world view still points at the outgoing scene here; by the swap it may not.
-		nextPrevScene = client.getTopLevelWorldView().getScene();
-		nextGameState = client.getGameState();
+		// The world view still points at the outgoing scene here; by the swap it may not.
+		final Scene prev = client.getTopLevelWorldView().getScene();
+		final GameState gameState = client.getGameState();
+
+		if (config.deferredSceneUpload())
+		{
+			// The client calls this on its map loader thread and only notices that the build has finished
+			// once per game cycle, so anything done here is rounded up to that cycle. Record what the swap
+			// needs and return: the plugin's whole share of the load happens in swapScene, on the client
+			// thread, after the client has noticed.
+			nextZones = null;
+			nextRoofChanges = null;
+			nextPrevScene = prev;
+			nextGameState = gameState;
+			nextScene = scene;
+			loadSceneDoneNanos = System.nanoTime();
+			return;
+		}
+
+		// Deferral off: the whole scene is prepared here as it always was, but in CPU staging and without
+		// any GL, so the swap only has to commit it.
+		Stopwatch swLoad = Stopwatch.createStarted();
+		deferredUploader.cancel();
+		Map<Integer, Integer> roofChanges = new HashMap<>();
+		Zone[][] newZones = planScene(scene, prev,
+			prev.isInstance() == scene.isInstance() && gameState == GameState.LOGGED_IN, roofChanges);
+		uploadNear(scene, newZones, false, mapUploader, false);
+		nextRoofChanges = roofChanges;
+		nextZones = newZones;
+		nextPrevScene = prev;
+		nextGameState = gameState;
 		nextScene = scene;
 		loadSceneDoneNanos = System.nanoTime();
+		log.debug("Scene load time {}", swLoad);
+	}
+
+	/**
+	 * Decide which of the current zones the new scene keeps and allocate the rest: every current zone is
+	 * marked cull, then the reused ones are unmarked and placed in the new table. Runs on the loader thread
+	 * with deferral off and on the client thread with it on; the swap consumes the result either way.
+	 */
+	private Zone[][] planScene(Scene scene, Scene prev, boolean mayReuse, Map<Integer, Integer> roofChanges)
+	{
+		SceneContext ctx = root;
+
+		regionManager.prepare(scene);
+
+		int dx = scene.getBaseX() - prev.getBaseX() >> 3;
+		int dy = scene.getBaseY() - prev.getBaseY() >> 3;
+
+		final int SCENE_ZONES = NUM_ZONES;
+
+		// initially mark every zone as needing culled
+		for (int x = 0; x < SCENE_ZONES; ++x)
+		{
+			for (int z = 0; z < SCENE_ZONES; ++z)
+			{
+				ctx.zones[x][z].cull = true;
+			}
+		}
+
+		// find zones which overlap and copy them
+		Zone[][] newZones = new Zone[SCENE_ZONES][SCENE_ZONES];
+		if (mayReuse)
+		{
+			int[][][] prevTemplates = prev.getInstanceTemplateChunks();
+			int[][][] curTemplates = scene.getInstanceTemplateChunks();
+
+			int[][][] prids = prev.getRoofs();
+			int[][][] nrids = scene.getRoofs();
+
+			for (int x = 0; x < SCENE_ZONES; ++x)
+			{
+				next:
+				for (int z = 0; z < SCENE_ZONES; ++z)
+				{
+					int ox = x + dx;
+					int oz = z + dy;
+
+					// Reused the old zone if it is also in the new scene, except for the edges, to work around
+					// tile blending, (edge) shadows, sharelight, etc.
+					if (canReuse(ctx.zones, ox, oz))
+					{
+						if (scene.isInstance())
+						{
+							// Convert from modified chunk coordinates to Jagex chunk coordinates
+							int jx = x - (SCENE_OFFSET / 8);
+							int jz = z - (SCENE_OFFSET / 8);
+							int jox = ox - (SCENE_OFFSET / 8);
+							int joz = oz - (SCENE_OFFSET / 8);
+							// Check Jagex chunk coordinates are within the Jagex scene
+							if (jx >= 0 && jx < Constants.SCENE_SIZE / 8 && jz >= 0 && jz < Constants.SCENE_SIZE / 8)
+							{
+								if (jox >= 0 && jox < Constants.SCENE_SIZE / 8 && joz >= 0 && joz < Constants.SCENE_SIZE / 8)
+								{
+									for (int level = 0; level < 4; ++level)
+									{
+										int prevTemplate = prevTemplates[level][jox][joz];
+										int curTemplate = curTemplates[level][jx][jz];
+										if (prevTemplate != curTemplate)
+										{
+											log.error("Instance template reuse mismatch! prev={} cur={}", prevTemplate, curTemplate);
+											continue next;
+										}
+									}
+								}
+							}
+						}
+
+						Zone old = ctx.zones[ox][oz];
+						assert old.initialized;
+
+						if (old.dirty)
+						{
+							continue;
+						}
+
+						assert old.sizeO > 0 || old.sizeA > 0;
+
+						// Roof ids aren't consistent between scenes, so build a mapping of old -> new roof ids
+						// Sometimes groups split or merge, so we can't copy the zone in that case
+						for (int level = 0; level < 4; level++)
+						{
+							for (int tx = 0; tx < 8; tx++)
+							{
+								for (int tz = 0; tz < 8; tz++)
+								{
+									int prid = prids[level][(ox << 3) + tx][(oz << 3) + tz];
+									int nrid = nrids[level][(x << 3) + tx][(z << 3) + tz];
+
+									if (prid != nrid && (prid == 0 || nrid == 0))
+									{
+										log.trace("Roof mismatch: {} -> {}", prid, nrid);
+										continue next;
+									}
+
+									Integer orid = roofChanges.putIfAbsent(prid, nrid);
+									if (orid == null)
+									{
+										log.trace("Roof change: {} -> {}", prid, nrid);
+									}
+									else if (orid != nrid)
+									{
+										log.trace("Roof mismatch: {} -> {} vs {}", prid, nrid, orid);
+										continue next;
+									}
+								}
+							}
+						}
+
+						assert old.cull;
+						old.cull = false;
+
+						newZones[x][z] = old;
+					}
+				}
+			}
+		}
+
+		// Fill out any zones that weren't copied
+		for (int x = 0; x < SCENE_ZONES; ++x)
+		{
+			for (int z = 0; z < SCENE_ZONES; ++z)
+			{
+				if (newZones[x][z] == null)
+				{
+					newZones[x][z] = new Zone();
+				}
+			}
+		}
+
+		return newZones;
+	}
+
+	/**
+	 * Size, stage and fill the zones of the new table that are uploaded before the scene is drawn: all of
+	 * them with deferral off, the block around the scene centre with it on; the rest are flagged pending
+	 * for the worker. On the client thread (commit set) each filled zone is also committed to GL.
+	 *
+	 * @return the number of zones left pending
+	 */
+	private int uploadNear(Scene scene, Zone[][] newZones, boolean defer, SceneUploader uploader, boolean commit)
+	{
+		final int radius = config.deferredUploadRadius();
+		final int center = NUM_ZONES >> 1;
+		Stopwatch sw = Stopwatch.createStarted();
+		int len = 0, lena = 0;
+		int reused = 0, near = 0, deferred = 0;
+		for (int x = 0; x < NUM_ZONES; ++x)
+		{
+			for (int z = 0; z < NUM_ZONES; ++z)
+			{
+				Zone zone = newZones[x][z];
+				if (zone.initialized)
+				{
+					reused++;
+					continue;
+				}
+
+				assert zone.glVao == 0;
+				assert zone.glVaoA == 0;
+				if (defer && !DeferredUploadScheduler.isNear(x, z, center, center, radius))
+				{
+					zone.pending = true;
+					deferred++;
+					continue;
+				}
+
+				uploader.zoneSize(scene, zone, x, z);
+				len += zone.sizeO;
+				lena += zone.sizeA;
+				near++;
+			}
+		}
+		log.debug("Scene size time {} reused {} near {} deferred {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
+			sw, reused, near, deferred,
+			len, (len * Zone.VERT_SIZE * 3) / 1024,
+			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
+
+		IntBuffer arena = arena(commit, (len + lena) * 3 * (Zone.VERT_SIZE / 4));
+		sw = Stopwatch.createStarted();
+		for (int x = 0; x < NUM_ZONES; ++x)
+		{
+			for (int z = 0; z < NUM_ZONES; ++z)
+			{
+				Zone zone = newZones[x][z];
+				if (!zone.initialized && !zone.pending)
+				{
+					zone.stage(arena);
+					uploader.uploadZone(scene, zone, x, z);
+					if (commit)
+					{
+						zone.commit();
+						zone.initialized = true;
+					}
+				}
+			}
+		}
+		log.debug("Scene upload time {} uploaded {} deferred {}", sw, near, deferred);
+		return deferred;
+	}
+
+	/**
+	 * The staging arena for the calling thread, cleared and grown to hold at least ints. One arena serves
+	 * the client thread (near zones at swap, one zone at a time in rebuild) and one the loader thread
+	 * (whole scenes with deferral off); each only ever holds zones its own next commit consumes.
+	 */
+	private IntBuffer arena(boolean clientThread, int ints)
+	{
+		IntBuffer arena = clientThread ? stagingArena : loaderArena;
+		if (arena == null || arena.capacity() < ints)
+		{
+			int oldCapacity = arena == null ? 0 : arena.capacity();
+			int capacity = Math.max(ints, oldCapacity + oldCapacity / 4);
+			log.debug("Staging arena ({}) {}kb -> {}kb", clientThread ? "client" : "loader", oldCapacity * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
+			arena = GpuIntBuffer.allocateDirect(capacity);
+			if (clientThread)
+			{
+				stagingArena = arena;
+			}
+			else
+			{
+				loaderArena = arena;
+			}
+		}
+		arena.clear();
+		return arena;
 	}
 
 	private static boolean canReuse(Zone[][] zones, int zx, int zz)
@@ -1818,154 +2079,56 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		final boolean matched = nextScene == scene;
 		final Scene prev = matched ? nextPrevScene : scene;
 		final GameState gameState = nextGameState;
+		final Zone[][] prepared = matched ? nextZones : null;
+		final Map<Integer, Integer> roofChanges = prepared != null ? nextRoofChanges : new HashMap<>();
 		nextScene = null;
 		nextPrevScene = null;
+		nextZones = null;
+		nextRoofChanges = null;
 		if (!matched)
 		{
 			log.warn("swapScene without a matching loadScene, nothing is reused");
 		}
-		// Zones are reused across loads only while walking within the same world; every other kind of load
-		// rebuilds everything
-		final boolean mayReuse = matched
-			&& prev.isInstance() == scene.isInstance()
-			&& gameState == GameState.LOGGED_IN;
-
-		// Stop filling the previous scene's deferred zones. Whatever is still pending is not initialized,
-		// so it is culled and freed below like any other unused zone.
-		deferredUploader.cancel();
 
 		SceneContext ctx = root;
-
-		regionManager.prepare(scene);
-
-		int dx = scene.getBaseX() - prev.getBaseX() >> 3;
-		int dy = scene.getBaseY() - prev.getBaseY() >> 3;
-
-		final int SCENE_ZONES = NUM_ZONES;
-
-		// initially mark every zone as needing culled
-		for (int x = 0; x < SCENE_ZONES; ++x)
+		final Zone[][] newZones;
+		final int pending;
+		if (prepared != null)
 		{
-			for (int z = 0; z < SCENE_ZONES; ++z)
+			// deferral off: the loader thread sized, staged and filled every zone; commit them
+			newZones = prepared;
+			pending = 0;
+			for (int x = 0; x < NUM_ZONES; ++x)
 			{
-				ctx.zones[x][z].cull = true;
-			}
-		}
-
-		Map<Integer, Integer> roofChanges = new HashMap<>();
-
-		// find zones which overlap and copy them
-		Zone[][] newZones = new Zone[SCENE_ZONES][SCENE_ZONES];
-		if (mayReuse)
-		{
-			int[][][] prevTemplates = prev.getInstanceTemplateChunks();
-			int[][][] curTemplates = scene.getInstanceTemplateChunks();
-
-			int[][][] prids = prev.getRoofs();
-			int[][][] nrids = scene.getRoofs();
-
-			for (int x = 0; x < SCENE_ZONES; ++x)
-			{
-				next:
-				for (int z = 0; z < SCENE_ZONES; ++z)
+				for (int z = 0; z < NUM_ZONES; ++z)
 				{
-					int ox = x + dx;
-					int oz = z + dy;
-
-					// Reused the old zone if it is also in the new scene, except for the edges, to work around
-					// tile blending, (edge) shadows, sharelight, etc.
-					if (canReuse(ctx.zones, ox, oz))
+					Zone zone = newZones[x][z];
+					if (!zone.initialized)
 					{
-						if (scene.isInstance())
-						{
-							// Convert from modified chunk coordinates to Jagex chunk coordinates
-							int jx = x - (SCENE_OFFSET / 8);
-							int jz = z - (SCENE_OFFSET / 8);
-							int jox = ox - (SCENE_OFFSET / 8);
-							int joz = oz - (SCENE_OFFSET / 8);
-							// Check Jagex chunk coordinates are within the Jagex scene
-							if (jx >= 0 && jx < Constants.SCENE_SIZE / 8 && jz >= 0 && jz < Constants.SCENE_SIZE / 8)
-							{
-								if (jox >= 0 && jox < Constants.SCENE_SIZE / 8 && joz >= 0 && joz < Constants.SCENE_SIZE / 8)
-								{
-									for (int level = 0; level < 4; ++level)
-									{
-										int prevTemplate = prevTemplates[level][jox][joz];
-										int curTemplate = curTemplates[level][jx][jz];
-										if (prevTemplate != curTemplate)
-										{
-											log.error("Instance template reuse mismatch! prev={} cur={}", prevTemplate, curTemplate);
-											continue next;
-										}
-									}
-								}
-							}
-						}
-
-						Zone old = ctx.zones[ox][oz];
-						assert old.initialized;
-
-						if (old.dirty)
-						{
-							continue;
-						}
-
-						assert old.sizeO > 0 || old.sizeA > 0;
-
-						// Roof ids aren't consistent between scenes, so build a mapping of old -> new roof ids
-						// Sometimes groups split or merge, so we can't copy the zone in that case
-						for (int level = 0; level < 4; level++)
-						{
-							for (int tx = 0; tx < 8; tx++)
-							{
-								for (int tz = 0; tz < 8; tz++)
-								{
-									int prid = prids[level][(ox << 3) + tx][(oz << 3) + tz];
-									int nrid = nrids[level][(x << 3) + tx][(z << 3) + tz];
-
-									if (prid != nrid && (prid == 0 || nrid == 0))
-									{
-										log.trace("Roof mismatch: {} -> {}", prid, nrid);
-										continue next;
-									}
-
-									Integer orid = roofChanges.putIfAbsent(prid, nrid);
-									if (orid == null)
-									{
-										log.trace("Roof change: {} -> {}", prid, nrid);
-									}
-									else if (orid != nrid)
-									{
-										log.trace("Roof mismatch: {} -> {} vs {}", prid, nrid, orid);
-										continue next;
-									}
-								}
-							}
-						}
-
-						assert old.cull;
-						old.cull = false;
-
-						newZones[x][z] = old;
+						zone.commit();
+						zone.initialized = true;
 					}
 				}
 			}
 		}
-
-		// Fill out any zones that weren't copied
-		for (int x = 0; x < SCENE_ZONES; ++x)
+		else
 		{
-			for (int z = 0; z < SCENE_ZONES; ++z)
-			{
-				if (newZones[x][z] == null)
-				{
-					newZones[x][z] = new Zone();
-				}
-			}
+			// deferral on: the plugin's whole share of the load happens here, after the client has noticed
+			// the build. Zones the worker has already filled are committed first so the new scene can reuse
+			// them; whatever is still pending is culled and freed below like any other unused zone.
+			deferredUploader.commitFinished();
+			deferredUploader.cancel();
+			// Zones are reused only while walking within the same world; every other kind of load rebuilds
+			final boolean mayReuse = matched
+				&& prev.isInstance() == scene.isInstance()
+				&& gameState == GameState.LOGGED_IN;
+			newZones = planScene(scene, prev, mayReuse, roofChanges);
+			// filled and committed before the table is installed, so a failure here leaves the old scene intact
+			pending = uploadNear(scene, newZones, true, clientUploader, true);
 		}
 
 		// free the old zones that were not reused (cancelled pending zones among them, which hold only
-		// staging) and carry the roof id changes into the reused ones, then install the new table
+		// staging), carry the roof id changes into the reused ones, then install the new table
 		for (int x = 0; x < ctx.sizeX; ++x)
 		{
 			for (int z = 0; z < ctx.sizeZ; ++z)
@@ -1983,83 +2146,22 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 		ctx.zones = newZones;
 
-		// Decide which new zones are uploaded now. With deferred upload on, only the zones near the scene
-		// centre (where the client puts the player) are sized, staged, filled and committed here; the rest
-		// are flagged pending and the worker sizes, stages and fills them, nearest the camera first.
-		final boolean defer = config.deferredSceneUpload();
-		final int radius = config.deferredUploadRadius();
-		final int center = NUM_ZONES >> 1;
-		Stopwatch sw = Stopwatch.createStarted();
-		int len = 0, lena = 0;
-		int reused = 0, near = 0, deferred = 0;
-		for (int x = 0; x < NUM_ZONES; ++x)
-		{
-			for (int z = 0; z < NUM_ZONES; ++z)
-			{
-				Zone zone = newZones[x][z];
-				if (zone.initialized)
-				{
-					reused++;
-					continue;
-				}
-
-				assert zone.glVao == 0;
-				assert zone.glVaoA == 0;
-				if (defer && !DeferredUploadScheduler.isNear(x, z, center, center, radius))
-				{
-					zone.pending = true;
-					deferred++;
-					continue;
-				}
-
-				clientUploader.zoneSize(scene, zone, x, z);
-				len += zone.sizeO;
-				lena += zone.sizeA;
-				near++;
-			}
-		}
-		log.debug("Scene size time {} reused {} near {} deferred {} len opaque {} size opaque {}kb len alpha {} size alpha {}kb",
-			sw, reused, near, deferred,
-			len, (len * Zone.VERT_SIZE * 3) / 1024,
-			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
-
-		// stage, fill and commit the near zones
-		int stagingInts = (len + lena) * 3 * (Zone.VERT_SIZE / 4);
-		if (stagingArena == null || stagingArena.capacity() < stagingInts)
-		{
-			int oldCapacity = stagingArena == null ? 0 : stagingArena.capacity();
-			int capacity = Math.max(stagingInts, oldCapacity + oldCapacity / 4);
-			log.debug("Staging arena {}kb -> {}kb", oldCapacity * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
-			stagingArena = GpuIntBuffer.allocateDirect(capacity);
-		}
-		stagingArena.clear();
-
-		sw = Stopwatch.createStarted();
-		for (int x = 0; x < NUM_ZONES; ++x)
-		{
-			for (int z = 0; z < NUM_ZONES; ++z)
-			{
-				Zone zone = newZones[x][z];
-				if (!zone.initialized && !zone.pending)
-				{
-					zone.stage(stagingArena);
-					clientUploader.uploadZone(scene, zone, x, z);
-					zone.commit();
-					zone.initialized = true;
-				}
-			}
-		}
-		log.debug("Scene upload time {} uploaded {} deferred {}", sw, near, deferred);
-
 		checkGLErrors();
 
-		if (deferred > 0)
+		if (pending > 0)
 		{
 			deferredUploader.start(scene, ctx.zones);
 		}
 		swapNanos = System.nanoTime();
 		awaitingFirstFrame = true;
-		log.debug("Scene swap time {} pending {}, began {} after loadScene returned", swSwap, deferred, millis(sinceLoad));
+		if (matched)
+		{
+			log.debug("Scene swap time {} pending {}, began {} after loadScene returned", swSwap, pending, millis(sinceLoad));
+		}
+		else
+		{
+			log.debug("Scene swap time {} pending {}", swSwap, pending);
+		}
 	}
 
 	private void swapSub(Scene scene)

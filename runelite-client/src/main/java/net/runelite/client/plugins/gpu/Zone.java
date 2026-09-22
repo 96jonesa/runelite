@@ -70,7 +70,7 @@ class Zone
 	boolean cull; // whether the zone is queued for deletion
 	boolean dirty; // whether the zone has temporary modifications
 	boolean invalidate; // whether the zone needs rebuilding
-	boolean pending; // whether the zone is staged but its upload was deferred past the scene swap
+	boolean pending; // whether the zone's sizing and upload were deferred to the worker
 
 	int[] levelOffsets = new int[4]; // buffer pos in ints for the end of the level
 
