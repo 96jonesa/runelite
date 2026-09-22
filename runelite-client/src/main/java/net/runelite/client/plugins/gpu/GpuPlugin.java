@@ -303,7 +303,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 		clientUploader = new SceneUploader(renderCallbackManager);
 		mapUploader = new SceneUploader(renderCallbackManager);
-		deferredUploader = new DeferredZoneUploader(clientThread, renderCallbackManager);
+		deferredUploader = new DeferredZoneUploader(renderCallbackManager);
 		clientThread.invoke(() ->
 		{
 			try
@@ -887,6 +887,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 			this.cameraYaw = client.getCameraYaw();
 			this.cameraPitch = client.getCameraPitch();
+			// zones the worker finished during the previous frame are drawn in this one
+			deferredUploader.commitFinished();
 			deferredUploader.setFocus((ctx.cameraX >> 10) + (SCENE_OFFSET >> 3), (ctx.cameraZ >> 10) + (SCENE_OFFSET >> 3));
 			preSceneDrawToplevel(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw);
 		}
@@ -1390,6 +1392,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		// fallback for when no frames are drawn; also lets a zone finished and invalidated in the same
+		// tick be rebuilt below
+		deferredUploader.commitFinished();
 		rebuild(wv);
 		for (WorldEntity we : wv.worldEntities())
 		{

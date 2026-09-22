@@ -30,10 +30,10 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.nio.IntBuffer;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Scene;
-import net.runelite.client.callback.ClientThread;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
 
@@ -43,8 +43,9 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
  * <p>
  * A pending zone has not been sized: the worker sizes it, slices staging for it from its own arena in
  * CPU memory, and fills it with its own {@link SceneUploader}, never touching GL. When a zone is
- * filled, the worker posts a completion to the client thread, which creates the zone's GL buffers from
- * the staging and marks it initialized so the next frame draws it.
+ * filled, the worker queues a completion; the client thread commits queued completions at the start of
+ * every frame ({@link #commitFinished()}), creating the zone's GL buffers from the staging and marking
+ * it initialized, so a zone finished during a frame is drawn by the next one.
  * <p>
  * The worker reads the live scene, which the client thread may be changing (object updates arrive
  * right after a map load), so a fill can fail. A failed zone is emptied, completed with its
@@ -58,10 +59,26 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
 @Slf4j
 class DeferredZoneUploader
 {
-	private final ClientThread clientThread;
 	private final SceneUploader uploader;
 	private final DeferredUploadScheduler scheduler = new DeferredUploadScheduler();
 	private final ExecutorService executor;
+
+	private static final class Completion
+	{
+		final PendingZone zone;
+		final int gen;
+		final boolean uploaded;
+
+		Completion(PendingZone zone, int gen, boolean uploaded)
+		{
+			this.zone = zone;
+			this.gen = gen;
+			this.uploaded = uploaded;
+		}
+	}
+
+	// zones the worker has filled, waiting for the client thread to commit them
+	private final ConcurrentLinkedQueue<Completion> completed = new ConcurrentLinkedQueue<>();
 
 	// worker thread only. Slices already handed to zones keep an outgrown arena alive until they commit.
 	private IntBuffer arena;
@@ -80,9 +97,8 @@ class DeferredZoneUploader
 	private int failed;
 	private Stopwatch stopwatch;
 
-	DeferredZoneUploader(ClientThread clientThread, RenderCallbackManager renderCallbackManager)
+	DeferredZoneUploader(RenderCallbackManager renderCallbackManager)
 	{
-		this.clientThread = clientThread;
 		this.uploader = new SceneUploader(renderCallbackManager);
 		this.executor = Executors.newSingleThreadExecutor(r ->
 		{
@@ -157,6 +173,7 @@ class DeferredZoneUploader
 		{
 			dropped = scheduler.size();
 			scheduler.cancel();
+			completed.clear(); // all stale now
 			f = drain;
 			drain = null;
 		}
@@ -215,9 +232,21 @@ class DeferredZoneUploader
 				ok = false;
 			}
 
-			final PendingZone done = p;
-			final boolean uploaded = ok;
-			clientThread.invoke(() -> finish(done, gen, uploaded));
+			completed.add(new Completion(p, gen, ok));
+		}
+	}
+
+	/**
+	 * Commit every zone the worker has finished since the last call. Client thread; called at the start
+	 * of each frame so finished zones are in that frame, and once per client tick as a fallback for when
+	 * no frames are being drawn.
+	 */
+	void commitFinished()
+	{
+		Completion c;
+		while ((c = completed.poll()) != null)
+		{
+			finish(c.zone, c.gen, c.uploaded);
 		}
 	}
 
