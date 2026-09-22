@@ -902,7 +902,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			if (awaitingFirstSceneDraw)
 			{
 				awaitingFirstSceneDraw = false;
-				log.debug("First scene draw after swap began {} later with {} deferred zones landed in time for it", millis(System.nanoTime() - swapNanos), landed);
+				log.trace("First scene draw after swap began {} later with {} deferred zones landed in time for it", millis(System.nanoTime() - swapNanos), landed);
 			}
 			deferredUploader.setFocus((ctx.cameraX >> 10) + (SCENE_OFFSET >> 3), (ctx.cameraZ >> 10) + (SCENE_OFFSET >> 3));
 			preSceneDrawToplevel(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw);
@@ -1504,7 +1504,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		if (awaitingFirstFrame)
 		{
 			awaitingFirstFrame = false;
-			log.debug("First frame after swap reached draw {} after the swap", millis(System.nanoTime() - swapNanos));
+			log.trace("First frame after swap reached draw {} after the swap", millis(System.nanoTime() - swapNanos));
 		}
 
 		final GameState gameState = client.getGameState();
@@ -1884,7 +1884,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 		}
-		log.debug("Scene plan: regions {}, reuse {} (mayReuse {}), alloc {}", millis(t1 - t0), millis(t2 - t1), mayReuse, millis(System.nanoTime() - t2));
+		log.trace("Scene plan: regions {}, reuse {} (mayReuse {}), alloc {}", millis(t1 - t0), millis(t2 - t1), mayReuse, millis(System.nanoTime() - t2));
 
 		return newZones;
 	}
@@ -2200,9 +2200,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		swapNanos = System.nanoTime();
 		awaitingFirstFrame = true;
 		awaitingFirstSceneDraw = true;
-		log.debug("Scene swap time {} (plan {}, near {}, free {}, start {}) pending {}{}", swSwap,
-			millis(tPlan), millis(tNear), millis(tFree), millis(tStart), pending,
-			matched ? ", began " + millis(sinceLoad) + " after loadScene returned" : "");
+		log.debug("Scene swap time {} (plan {}, near {}, free {}, start {}) pending {}", swSwap,
+			millis(tPlan), millis(tNear), millis(tFree), millis(tStart), pending);
+		if (matched)
+		{
+			log.trace("Swap began {} after loadScene returned", millis(sinceLoad));
+		}
 	}
 
 	private void swapSub(Scene scene)
