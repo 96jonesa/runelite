@@ -282,14 +282,19 @@ class DeferredZoneUploader
 	 * Commit every zone the worker has finished since the last call. Client thread; called at the start
 	 * of each frame so finished zones are in that frame, and once per client tick as a fallback for when
 	 * no frames are being drawn.
+	 *
+	 * @return the number of zones committed
 	 */
-	void commitFinished()
+	int commitFinished()
 	{
+		int n = 0;
 		Completion c;
 		while ((c = completed.poll()) != null)
 		{
 			finish(c.zone, c.gen, c.uploaded);
+			++n;
 		}
+		return n;
 	}
 
 	// worker thread

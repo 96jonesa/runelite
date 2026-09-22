@@ -203,6 +203,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private volatile long loadSceneDoneNanos;
 	private long swapNanos;
 	private boolean awaitingFirstFrame;
+	private boolean awaitingFirstSceneDraw;
 
 	static class SceneContext
 	{
@@ -897,7 +898,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			this.cameraYaw = client.getCameraYaw();
 			this.cameraPitch = client.getCameraPitch();
 			// zones the worker finished during the previous frame are drawn in this one
-			deferredUploader.commitFinished();
+			int landed = deferredUploader.commitFinished();
+			if (awaitingFirstSceneDraw)
+			{
+				awaitingFirstSceneDraw = false;
+				log.debug("First scene draw after swap began {} later with {} deferred zones landed in time for it", millis(System.nanoTime() - swapNanos), landed);
+			}
 			deferredUploader.setFocus((ctx.cameraX >> 10) + (SCENE_OFFSET >> 3), (ctx.cameraZ >> 10) + (SCENE_OFFSET >> 3));
 			preSceneDrawToplevel(scene, cameraX, cameraY, cameraZ, cameraPitch, cameraYaw);
 		}
@@ -2193,6 +2199,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		long tStart = System.nanoTime() - tStart0;
 		swapNanos = System.nanoTime();
 		awaitingFirstFrame = true;
+		awaitingFirstSceneDraw = true;
 		log.debug("Scene swap time {} (plan {}, near {}, free {}, start {}) pending {}{}", swSwap,
 			millis(tPlan), millis(tNear), millis(tFree), millis(tStart), pending,
 			matched ? ", began " + millis(sinceLoad) + " after loadScene returned" : "");
