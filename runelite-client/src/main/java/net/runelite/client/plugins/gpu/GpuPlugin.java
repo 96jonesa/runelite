@@ -1750,7 +1750,9 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	{
 		SceneContext ctx = root;
 
+		long t0 = System.nanoTime();
 		regionManager.prepare(scene);
+		long t1 = System.nanoTime();
 
 		int dx = scene.getBaseX() - prev.getBaseX() >> 3;
 		int dy = scene.getBaseY() - prev.getBaseY() >> 3;
@@ -1864,6 +1866,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
+		long t2 = System.nanoTime();
 		// Fill out any zones that weren't copied
 		for (int x = 0; x < SCENE_ZONES; ++x)
 		{
@@ -1875,6 +1878,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 		}
+		log.debug("Scene plan: regions {}, reuse {} (mayReuse {}), alloc {}", millis(t1 - t0), millis(t2 - t1), mayReuse, millis(System.nanoTime() - t2));
 
 		return newZones;
 	}
