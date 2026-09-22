@@ -63,12 +63,14 @@ class Zone
 
 	int sizeO, sizeA;
 	VBO vboO, vboA;
+	// vertex data written by the uploader, in CPU memory, until commit() turns it into the GL buffers
+	IntBuffer stageO, stageA;
 
 	boolean initialized; // whether the zone vao and vbos are ready
 	boolean cull; // whether the zone is queued for deletion
 	boolean dirty; // whether the zone has temporary modifications
 	boolean invalidate; // whether the zone needs rebuilding
-	boolean pending; // whether the zone is mapped but its upload was deferred past the scene swap
+	boolean pending; // whether the zone is staged but its upload was deferred past the scene swap
 
 	int[] levelOffsets = new int[4]; // buffer pos in ints for the end of the level
 
@@ -78,28 +80,108 @@ class Zone
 
 	final List<AlphaModel> alphaModels = new ArrayList<>(0);
 
-	void init(VBO o, VBO a)
+	private static final int INTS_PER_FACE = 3 * (VERT_SIZE / 4);
+
+	/**
+	 * Give the zone its own staging buffers, sized from zoneSize(). Any thread, no GL.
+	 */
+	void stage()
+	{
+		stageO = sizeO > 0 ? GpuIntBuffer.allocateDirect(sizeO * INTS_PER_FACE) : null;
+		stageA = sizeA > 0 ? GpuIntBuffer.allocateDirect(sizeA * INTS_PER_FACE) : null;
+	}
+
+	/**
+	 * Number of ints of staging the zone takes from an arena in {@link #stage(IntBuffer)}.
+	 */
+	int stagingInts()
+	{
+		return (sizeO + sizeA) * INTS_PER_FACE;
+	}
+
+	/**
+	 * Give the zone staging buffers sliced from the arena at its position, which is advanced past them.
+	 */
+	void stage(IntBuffer arena)
+	{
+		stageO = slice(arena, sizeO * INTS_PER_FACE);
+		stageA = slice(arena, sizeA * INTS_PER_FACE);
+	}
+
+	private static IntBuffer slice(IntBuffer arena, int ints)
+	{
+		if (ints == 0)
+		{
+			return null;
+		}
+		int start = arena.position();
+		arena.limit(start + ints);
+		IntBuffer s = arena.slice();
+		arena.limit(arena.capacity());
+		arena.position(start + ints);
+		return s;
+	}
+
+	/**
+	 * Create the GL buffers and vertex arrays from the staging buffers, then drop the staging. Client
+	 * thread. Staging nothing was written to yields no GL buffer, so such a zone draws nothing.
+	 */
+	void commit()
 	{
 		assert glVao == 0;
 		assert glVaoA == 0;
 
-		if (o != null)
+		if (stageO != null)
 		{
-			vboO = o;
-			glVao = glGenVertexArrays();
-			setupVao(glVao, o.bufId);
+			stageO.flip();
+			bufLen = stageO.remaining() / (VERT_SIZE / 4);
+			if (stageO.hasRemaining())
+			{
+				vboO = new VBO(stageO.remaining() * Integer.BYTES);
+				vboO.init(GL_STATIC_DRAW, stageO);
+				glVao = glGenVertexArrays();
+				setupVao(glVao, vboO.bufId);
+			}
+			stageO = null;
 		}
 
-		if (a != null)
+		if (stageA != null)
 		{
-			vboA = a;
-			glVaoA = glGenVertexArrays();
-			setupVao(glVaoA, a.bufId);
+			stageA.flip();
+			bufLenA = stageA.remaining() / (VERT_SIZE / 4);
+			if (stageA.hasRemaining())
+			{
+				vboA = new VBO(stageA.remaining() * Integer.BYTES);
+				vboA.init(GL_STATIC_DRAW, stageA);
+				glVaoA = glGenVertexArrays();
+				setupVao(glVaoA, vboA.bufId);
+			}
+			stageA = null;
 		}
+
+		// the static alpha models were recorded by the uploader before the vertex array existed
+		for (AlphaModel m : alphaModels)
+		{
+			if (!m.isTemp() && (m.flags & AlphaModel.TEMP) == 0)
+			{
+				m.vao = glVaoA;
+			}
+		}
+	}
+
+	/**
+	 * Forget the staging buffers without committing them.
+	 */
+	void dropStaging()
+	{
+		stageO = null;
+		stageA = null;
 	}
 
 	void free()
 	{
+		dropStaging();
+
 		if (vboO != null)
 		{
 			vboO.destroy();
@@ -130,46 +212,24 @@ class Zone
 	}
 
 	/**
-	 * Empty a zone whose upload was abandoned part way, so that once unmapped it draws nothing. The
-	 * buffers stay mapped; unmap() then records a length of zero.
+	 * Empty a zone whose upload was abandoned part way, so that commit() creates no buffers and the zone
+	 * draws nothing.
 	 */
 	void discardUpload()
 	{
-		if (vboO != null)
+		if (stageO != null)
 		{
-			vboO.vb.position(0);
+			stageO.clear();
 		}
-		if (vboA != null)
+		if (stageA != null)
 		{
-			vboA.vb.position(0);
+			stageA.clear();
 		}
 		rids = new int[4][0];
 		roofStart = new int[4][0];
 		roofEnd = new int[4][0];
 		Arrays.fill(levelOffsets, 0);
 		alphaModels.clear();
-	}
-
-	void unmap()
-	{
-		if (vboO != null)
-		{
-			vboO.unmap();
-		}
-		if (vboA != null)
-		{
-			vboA.unmap();
-		}
-
-		if (vboO != null)
-		{
-			this.bufLen = vboO.len / (VERT_SIZE / 4);
-		}
-
-		if (vboA != null)
-		{
-			this.bufLenA = vboA.len / (VERT_SIZE / 4);
-		}
 	}
 
 	private void setupVao(int vao, int buffer)

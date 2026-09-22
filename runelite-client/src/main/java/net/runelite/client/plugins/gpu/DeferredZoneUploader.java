@@ -40,19 +40,20 @@ import net.runelite.client.plugins.gpu.DeferredUploadScheduler.PendingZone;
  * Fills the zones that {@link GpuPlugin#loadScene} left pending, on a worker thread, after the scene
  * has been swapped in.
  * <p>
- * A pending zone already has its buffers allocated and mapped (that happened on the client thread
- * during the load), so the worker only writes vertex data into mapped memory with its own
+ * A pending zone already has its staging buffers (CPU memory sliced from the plugin's staging arena
+ * during the load), so the worker only writes vertex data into them with its own
  * {@link SceneUploader} and never touches GL. When a zone is filled, the worker posts a completion to
- * the client thread, which unmaps the zone and marks it initialized so the next frame draws it.
+ * the client thread, which creates the zone's GL buffers from the staging and marks it initialized so
+ * the next frame draws it.
  * <p>
  * The worker reads the live scene, which the client thread may be changing (object updates arrive
  * right after a map load), so a fill can fail. A failed zone is emptied, completed with its
  * invalidate flag set, and rebuilt from the current scene contents by the plugin's normal rebuild
  * path on the client thread.
  * <p>
- * Freeing a pending zone while the worker writes to it would be a use after unmap, so every path that
- * frees zones (the next scene load, plugin shutdown) calls {@link #cancel()} first, which drops the
- * queue and waits for the zone being filled.
+ * The next scene load reuses the staging arena, so it calls {@link #cancel()} first, which drops the
+ * queue and waits for the zone being filled; a completion that is still queued for the client thread
+ * then carries a stale generation and is ignored rather than committing overwritten staging.
  */
 @Slf4j
 class DeferredZoneUploader
@@ -141,7 +142,7 @@ class DeferredZoneUploader
 
 	/**
 	 * Drop every queued zone and wait for the zone currently being filled, if any, so that the caller
-	 * may free pending zones afterwards. Completions the worker already posted are ignored by the client
+	 * may reuse the staging afterwards. Completions the worker already posted are ignored by the client
 	 * thread because they carry the old generation. Must not be called from the worker thread.
 	 */
 	void cancel()
@@ -160,7 +161,7 @@ class DeferredZoneUploader
 		{
 			try
 			{
-				// an interrupted wait must not return early: the caller frees the zones next
+				// an interrupted wait must not return early: the caller reuses the staging next
 				Uninterruptibles.getUninterruptibly(f);
 			}
 			catch (ExecutionException e)
@@ -211,13 +212,18 @@ class DeferredZoneUploader
 	private void finish(PendingZone p, int gen, boolean uploaded)
 	{
 		Zone zone = p.zone;
-		if (!scheduler.isCurrent(gen) || !zone.pending)
+		// the generation check and the commit are one step under the lock cancel() bumps the generation
+		// under, so a load that starts reusing the staging arena after cancel() can't race a commit
+		synchronized (this)
 		{
-			// cancelled after the fill; the zone is freed with the scene it belongs to
-			return;
-		}
+			if (!scheduler.isCurrent(gen) || !zone.pending)
+			{
+				// cancelled after the fill; the zone is freed with the scene it belongs to
+				return;
+			}
 
-		zone.unmap();
+			zone.commit();
+		}
 		zone.initialized = true;
 		zone.pending = false;
 		if (!uploaded)

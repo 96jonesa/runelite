@@ -53,6 +53,20 @@ class VBO
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 	}
 
+	/**
+	 * Create the buffer and fill it with data's contents from its position to its limit.
+	 */
+	void init(int usage, IntBuffer data)
+	{
+		this.usage = usage;
+		bufId = glGenBuffers();
+		len = data.remaining();
+
+		glBindBuffer(GL_ARRAY_BUFFER, bufId);
+		glBufferData(GL_ARRAY_BUFFER, data, usage);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+	}
+
 	void destroy()
 	{
 		if (mapped)

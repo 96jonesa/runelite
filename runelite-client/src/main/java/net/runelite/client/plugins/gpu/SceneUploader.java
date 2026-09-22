@@ -91,8 +91,8 @@ class SceneUploader
 		int[][][] roofs = scene.getRoofs();
 		Set<Integer> roofIds = new HashSet<>();
 
-		var vb = zone.vboO != null ? new GpuIntBuffer(zone.vboO.vb) : null;
-		var ab = zone.vboA != null ? new GpuIntBuffer(zone.vboA.vb) : null;
+		var vb = zone.stageO != null ? new GpuIntBuffer(zone.stageO) : null;
+		var ab = zone.stageA != null ? new GpuIntBuffer(zone.stageA) : null;
 
 		for (int level = 0; level <= 3; ++level)
 		{
@@ -130,9 +130,9 @@ class SceneUploader
 				uploadZoneLevel(scene, zone, mzx, mzz, level, false, roofIds, vb, ab);
 			}
 
-			if (zone.vboO != null)
+			if (zone.stageO != null)
 			{
-				int pos = zone.vboO.vb.position();
+				int pos = zone.stageO.position();
 				zone.levelOffsets[level] = pos;
 			}
 		}
@@ -145,11 +145,11 @@ class SceneUploader
 		// upload the roofs and save their positions
 		for (int id : roofIds)
 		{
-			int pos = zone.vboO != null ? zone.vboO.vb.position() : 0;
+			int pos = zone.stageO != null ? zone.stageO.position() : 0;
 
 			uploadZoneLevelRoof(scene, zone, mzx, mzz, level, id, visbelow, vb, ab);
 
-			int endpos = zone.vboO != null ? zone.vboO.vb.position() : 0;
+			int endpos = zone.stageO != null ? zone.stageO.position() : 0;
 
 			if (endpos > pos)
 			{
@@ -403,7 +403,7 @@ class SceneUploader
 
 	private void uploadZoneRenderable(Renderable r, Zone zone, int orient, int x, int y, int z, int lx, int lz, int ux, int uz, int id, GpuIntBuffer vb, GpuIntBuffer ab)
 	{
-		int pos = zone.vboA != null ? zone.vboA.vb.position() : 0;
+		int pos = zone.stageA != null ? zone.stageA.position() : 0;
 		Model model = null;
 		if (r instanceof Model)
 		{
@@ -418,7 +418,7 @@ class SceneUploader
 				uploadStaticModel(model, orient, x - basex, y, z - basez, vb, ab);
 			}
 		}
-		int endpos = zone.vboA != null ? zone.vboA.vb.position() : 0;
+		int endpos = zone.stageA != null ? zone.stageA.position() : 0;
 		if (endpos > pos)
 		{
 			assert model != null;
@@ -433,6 +433,7 @@ class SceneUploader
 				assert ux < 25 : ux; // largest object?
 				assert uz < 25 : uz;
 			}
+			// the vertex array does not exist yet; Zone.commit() fills it in on the recorded models
 			zone.addAlphaModel(zone.glVaoA, model, pos, endpos,
 				x - basex, y, z - basez,
 				lx, lz, ux, uz,

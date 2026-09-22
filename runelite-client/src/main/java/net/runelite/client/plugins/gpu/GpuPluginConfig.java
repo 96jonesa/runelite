@@ -268,6 +268,6 @@ public interface GpuPluginConfig extends Config
 	)
 	default int deferredUploadRadius()
 	{
-		return 3;
+		return 1;
 	}
 }

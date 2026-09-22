@@ -36,10 +36,10 @@ import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
@@ -190,6 +190,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 	private SceneUploader clientUploader, mapUploader;
 	private DeferredZoneUploader deferredUploader;
+	// CPU memory the loader writes a scene's vertex data into; reused across loads, grown when a scene
+	// needs more. Only touched by the thread running loadScene.
+	private IntBuffer stagingArena;
+	// the same for rebuild, which stages one zone at a time on the client thread
+	private IntBuffer rebuildArena;
 
 	static class SceneContext
 	{
@@ -456,9 +461,11 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 			if (deferredUploader != null)
 			{
-				// waits for the zone being filled so root.free() below can't unmap under the worker
+				// waits for the zone being filled so nothing writes staging after root.free() below
 				deferredUploader.shutdown();
 			}
+			stagingArena = null;
+			rebuildArena = null;
 
 			if (lwjglInitted)
 			{
@@ -1417,29 +1424,15 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				Scene scene = wv.getScene();
 				clientUploader.zoneSize(scene, zone, x, z);
-
-				VBO o = null, a = null;
-				int sz = zone.sizeO * Zone.VERT_SIZE * 3;
-				if (sz > 0)
+				int stagingInts = zone.stagingInts();
+				if (rebuildArena == null || rebuildArena.capacity() < stagingInts)
 				{
-					o = new VBO(sz);
-					o.init(GL_STATIC_DRAW);
-					o.map();
+					rebuildArena = GpuIntBuffer.allocateDirect(stagingInts);
 				}
-
-				sz = zone.sizeA * Zone.VERT_SIZE * 3;
-				if (sz > 0)
-				{
-					a = new VBO(sz);
-					a.init(GL_STATIC_DRAW);
-					a.map();
-				}
-
-				zone.init(o, a);
-
+				rebuildArena.clear();
+				zone.stage(rebuildArena);
 				clientUploader.uploadZone(scene, zone, x, z);
-
-				zone.unmap();
+				zone.commit();
 				zone.initialized = true;
 				zone.dirty = true;
 
@@ -1691,41 +1684,39 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		Stopwatch swLoad = Stopwatch.createStarted();
 
 		// Stop filling the previous scene's deferred zones. Whatever is still pending is not initialized,
-		// so it is culled and freed by the swap like any other unused zone.
+		// so it is culled and freed by the swap like any other unused zone. Its staging is dropped now so
+		// that, should the arena be replaced below, the old one is not kept alive until the swap.
 		deferredUploader.cancel();
+		for (Zone[] column : root.zones)
+		{
+			for (Zone zone : column)
+			{
+				if (zone.pending)
+				{
+					zone.dropStaging();
+				}
+			}
+		}
 
 		if (nextZones != null)
 		{
 			log.debug("Double zone load!");
 			// The previous scene load just gets dropped, this is uncommon and requires a back to back map build packet
 			// while having the first load take more than a full server cycle to complete
-			CountDownLatch latch = new CountDownLatch(1);
-			clientThread.invoke(() ->
+			for (int x = 0; x < NUM_ZONES; ++x)
 			{
-				for (int x = 0; x < NUM_ZONES; ++x)
+				for (int z = 0; z < NUM_ZONES; ++z)
 				{
-					for (int z = 0; z < NUM_ZONES; ++z)
+					Zone zone = nextZones[x][z];
+					assert !zone.cull;
+					// anything initialized is a reused zone and so shouldn't be freed; the others were never
+					// committed, so they hold staging and no GL objects and can be dropped on this thread
+					if (!zone.initialized)
 					{
-						Zone zone = nextZones[x][z];
-						assert !zone.cull;
-						// anything initialized is a reused zone and so shouldn't be freed
-						if (!zone.initialized)
-						{
-							zone.unmap();
-							zone.initialized = true;
-							zone.free();
-						}
+						assert zone.glVao == 0 && zone.glVaoA == 0;
+						zone.free();
 					}
 				}
-				latch.countDown();
-			});
-			try
-			{
-				latch.await();
-			}
-			catch (InterruptedException e)
-			{
-				throw new RuntimeException(e);
 			}
 			nextZones = null;
 			nextRoofChanges = null;
@@ -1893,55 +1884,44 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			len, (len * Zone.VERT_SIZE * 3) / 1024,
 			lena, (lena * Zone.VERT_SIZE * 3) / 1024);
 
-		// allocate buffers for zones which require upload
-		CountDownLatch latch = new CountDownLatch(1);
-		clientThread.invoke(() ->
+		// Stage the zones which require upload in CPU memory. No GL happens on this thread: the GL
+		// buffers are created from the staging at swap (or, for deferred zones, as each is filled), so the
+		// load never waits for the client thread. The arena is safe to reuse because the previous load's
+		// worker was cancelled above and its uncommitted zones are dropped by the swap.
+		int stagingInts = 0;
+		for (int x = 0; x < NUM_ZONES; ++x)
 		{
-			for (int x = 0; x < Constants.EXTENDED_SCENE_SIZE >> 3; ++x)
+			for (int z = 0; z < NUM_ZONES; ++z)
 			{
-				for (int z = 0; z < Constants.EXTENDED_SCENE_SIZE >> 3; ++z)
+				Zone zone = newZones[x][z];
+				if (!zone.initialized)
 				{
-					Zone zone = newZones[x][z];
-
-					if (zone.initialized)
-					{
-						continue;
-					}
-
-					VBO o = null, a = null;
-					int sz = zone.sizeO * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						o = new VBO(sz);
-						o.init(GL_STATIC_DRAW);
-						o.map();
-					}
-
-					sz = zone.sizeA * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						a = new VBO(sz);
-						a.init(GL_STATIC_DRAW);
-						a.map();
-					}
-
-					zone.init(o, a);
+					stagingInts += zone.stagingInts();
 				}
 			}
-
-			latch.countDown();
-		});
-		try
-		{
-			latch.await();
 		}
-		catch (InterruptedException e)
+		if (stagingArena == null || stagingArena.capacity() < stagingInts)
 		{
-			throw new RuntimeException(e);
+			int oldCapacity = stagingArena == null ? 0 : stagingArena.capacity();
+			int capacity = Math.max(stagingInts, oldCapacity + oldCapacity / 4);
+			log.debug("Staging arena {}kb -> {}kb", oldCapacity * Integer.BYTES / 1024, capacity * Integer.BYTES / 1024);
+			stagingArena = GpuIntBuffer.allocateDirect(capacity);
+		}
+		stagingArena.clear();
+		for (int x = 0; x < NUM_ZONES; ++x)
+		{
+			for (int z = 0; z < NUM_ZONES; ++z)
+			{
+				Zone zone = newZones[x][z];
+				if (!zone.initialized)
+				{
+					zone.stage(stagingArena);
+				}
+			}
 		}
 
 		// upload zones. With deferred upload on, only the zones near the scene centre (where the client
-		// puts the player) are filled here; the rest stay mapped and are filled after the swap.
+		// puts the player) are filled here; the rest keep their staging and are filled after the swap.
 		final boolean defer = config.deferredSceneUpload();
 		final int radius = config.deferredUploadRadius();
 		final int center = NUM_ZONES >> 1;
@@ -2035,46 +2015,14 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 
-		// allocate buffers for zones which require upload
-		CountDownLatch latch = new CountDownLatch(1);
-		clientThread.invoke(() ->
+		// stage in CPU memory; swapSub creates the GL buffers. Sub scenes get their own staging because
+		// a top level load may reuse the arena before this scene is swapped in.
+		for (int x = 0; x < ctx.sizeX; ++x)
 		{
-			for (int x = 0; x < ctx.sizeX; ++x)
+			for (int z = 0; z < ctx.sizeZ; ++z)
 			{
-				for (int z = 0; z < ctx.sizeZ; ++z)
-				{
-					Zone zone = ctx.zones[x][z];
-
-					VBO o = null, a = null;
-					int sz = zone.sizeO * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						o = new VBO(sz);
-						o.init(GL_STATIC_DRAW);
-						o.map();
-					}
-
-					sz = zone.sizeA * Zone.VERT_SIZE * 3;
-					if (sz > 0)
-					{
-						a = new VBO(sz);
-						a.init(GL_STATIC_DRAW);
-						a.map();
-					}
-
-					zone.init(o, a);
-				}
+				ctx.zones[x][z].stage();
 			}
-
-			latch.countDown();
-		});
-		try
-		{
-			latch.await();
-		}
-		catch (InterruptedException e)
-		{
-			throw new RuntimeException(e);
 		}
 
 		for (int x = 0; x < ctx.sizeX; ++x)
@@ -2149,12 +2097,12 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				if (zone.pending)
 				{
-					// stays mapped until the deferred upload has filled it
+					// keeps its staging until the deferred upload has filled it
 					++pending;
 				}
 				else if (!zone.initialized)
 				{
-					zone.unmap();
+					zone.commit();
 					zone.initialized = true;
 				}
 			}
@@ -2186,7 +2134,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 
 				if (!zone.initialized)
 				{
-					zone.unmap();
+					zone.commit();
 					zone.initialized = true;
 				}
 			}
